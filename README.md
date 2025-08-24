@@ -46,3 +46,7 @@ Medical Genetics: Documenting hereditary conditions such as Lynch syndrome or BR
 Education: Teaching students about inheritance patterns.
 
 Family Research: Creating visually accurate family trees with medical details.
+
+
+
+whatsapp 09101248637
