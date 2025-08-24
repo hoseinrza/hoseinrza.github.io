@@ -1,0 +1,1635 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Clinical Pedigree (Light · English · Responsive)</title>
+
+  <!-- D3.js -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <!-- Export helpers -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.5.1/dist/html2canvas.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+
+  <style>
+    :root{
+      /* Light Theme */
+      --bg:#ffffff;
+      --panel:#f7f9fb;
+      --muted:#6b7280;
+      --ink:#111827;
+      --ink-soft:#374151;
+      --accent:#2563eb;
+      --stroke:#475569;
+      --marriage:#64748b;
+      --positive:#dc2626;
+      --negative:#059669;
+      --unknown:#9ca3af;
+      --carrier-fill:#94a3b8;
+
+      /* Layout */
+      /*
+        The sizing variables below control the overall spacing of the pedigree.  In
+        earlier iterations the chart suffered from cramped vertical spacing and
+        excessive width.  Increasing the vertical separation between generations
+        improves readability, while slightly reducing the default sibling gap
+        reduces the overall width of large families.  The node width has been
+        increased to allow longer names without forcing the text to overlap
+        neighbouring nodes.  These changes should help mitigate overlapping
+        connection lines and improve the visual balance of the chart.
+      */
+      /* Adjust glyph dimensions to make person shapes square. */
+      --node-w:60;
+      --node-h:60;
+      --gen-gap:220;   /* vertical distance between generations (further increased for clarity) */
+      --sib-gap:60;    /* horizontal gap between siblings (increased for clarity) */
+      /* Reduce the default horizontal spacing between spouses to tighten
+         the connection of parent pairs.  In the original layout the gap
+         between partners on the top generation appeared too wide on
+         wider screens, which made the family tree feel disjointed.  A
+         smaller spouse gap of 40px still leaves enough room for labels
+         while keeping partners visually closer together. */
+      /* Increase the distance between spouses to prevent overlapping of
+         partner nodes and to give enough room for the vertical drops
+         from the parental generation.  With square male shapes of 60px
+         width, a gap of 80px provides ample separation. */
+      --spouse-gap:80; /* distance between spouses */
+
+      /* Fonts */
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif;
+      --font-symbol: "Segoe UI Symbol","Noto Sans Symbols", sans-serif;
+    }
+
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--ink); font-family:var(--font); }
+    * { box-sizing: border-box; }
+
+    .app{
+      display:grid;
+      grid-template-columns: 320px 1fr;
+      grid-template-rows: auto 1fr auto;
+      grid-template-areas:
+        "header header"
+        "side chart"
+        "footer footer";
+      height:100%;
+    }
+
+    /* ---------- Toolbar ---------- */
+    header{
+      grid-area:header;
+      display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
+      padding:.6rem 1rem; border-bottom:1px solid #e5e7eb; background:#f8fafc;
+      position:sticky; top:0; z-index:5;
+    }
+    header .group{ display:flex; align-items:center; gap:.4rem; flex-wrap:wrap; }
+    header .spacer{ flex:1 1 auto; }
+    header .btn, header summary.btn{
+      background:#ffffff; border:1px solid #d1d5db; border-radius:8px;
+      color:var(--ink); padding:.45rem .7rem; cursor:pointer; font-size:.92rem; line-height:1;
+      user-select:none;
+    }
+    header .btn:hover, header summary.btn:hover{ border-color:#9ca3af; }
+    header select, header input{
+      background:#ffffff; color:var(--ink); border:1px solid #d1d5db; border-radius:8px; padding:.35rem .5rem;
+      font-size:.92rem;
+    }
+    /* More (overflow) menu */
+    details.more{ position:relative; display:none; }
+    details.more[open] .menu{ display:block; }
+    details.more summary{ list-style:none; }
+    details.more summary::-webkit-details-marker{ display:none; }
+    .menu{
+      position:absolute; right:0; top:calc(100% + 6px); min-width:240px;
+      background:#fff; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 10px 30px #0000001a;
+      padding:.5rem; display:none;
+    }
+    .menu .section{ padding:.35rem .4rem; font-size:.78rem; color:#6b7280; }
+    .menu .row{ display:flex; gap:.4rem; flex-wrap:wrap; padding:.25rem .4rem .5rem; border-bottom:1px dashed #e5e7eb; }
+    .menu .row:last-child{ border-bottom:0; }
+
+    /* Hide secondary & export groups on narrow screens; show More menu instead */
+    @media (max-width: 980px){
+      header .group--secondary, header .group--export{ display:none; }
+      details.more{ display:block; }
+    }
+
+    /* ---------- Panels ---------- */
+    #chart-wrap{ grid-area:chart; position:relative; overflow:hidden; }
+    svg{ width:100%; height:100%; display:block; background:
+        radial-gradient(1400px 800px at 50% -300px, #eef2ff 0, #ffffff 60%); }
+    .overlay{ fill:transparent; pointer-events:all; }
+
+    aside{
+      grid-area:side; border-inline-end:1px solid #e5e7eb; background:var(--panel);
+      padding:.8rem; overflow:auto;
+    }
+    aside h3{ margin:.2rem 0 .6rem; font-size:1.05rem; }
+    .field{ display:flex; flex-direction:column; gap:.25rem; margin:.5rem 0; }
+    .field input, .field select, .field textarea{
+      background:#ffffff; color:var(--ink); border:1px solid #d1d5db; border-radius:8px; padding:.4rem .5rem;
+    }
+    .row{ display:flex; gap:.5rem; }
+    .row .field{ flex:1; }
+
+    .editor-hidden aside{ display:none; }
+    .editor-hidden #chart-wrap{ grid-column: 1 / -1; }
+
+    footer{
+      grid-area:footer; border-top:1px solid #e5e7eb; background:#f8fafc; color:#4b5563;
+      font-size:.85rem; padding:.5rem .8rem; display:flex; justify-content:space-between; align-items:center; gap:.5rem;
+      flex-wrap:wrap;
+    }
+    .legend{ display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
+    .key{ display:flex; align-items:center; gap:.35rem; }
+    .key .dot{ width:16px; height:16px; border-radius:4px; background:#94a3b8; display:inline-block; }
+
+    /* ---------- Pedigree styles ---------- */
+    .edge, .marriage, .sibline { stroke:var(--stroke); fill:none; vector-effect:non-scaling-stroke; }
+    .marriage{ stroke:var(--marriage); stroke-width:2; }
+    .sibline{ stroke:var(--marriage); stroke-width:1.5; }
+    .drop{ stroke:var(--marriage); }
+
+    /* Draw lines with an animated dashed offset so they appear to be
+       drawn live.  The dash array and offset are large enough to cover
+       typical line lengths, and the animation runs once on load. */
+    @keyframes drawLine {
+      from { stroke-dashoffset: 1000; }
+      to   { stroke-dashoffset: 0; }
+    }
+    .edge, .marriage-line, .sibline, .drop {
+      stroke-dasharray: 1000;
+      stroke-dashoffset: 1000;
+      animation: drawLine 0.6s ease-out forwards;
+    }
+
+    /* Rope-like appearance: round the ends of lines so they look like rope segments. */
+    .edge, .marriage-line, .sibline, .drop {
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .person{ cursor:pointer; }
+    .person .shape{ fill:#ffffff; stroke:#111827; stroke-width:2; vector-effect:non-scaling-stroke; }
+
+    /* label baseline from top to avoid overlaps; sub-label slightly muted */
+    .person .label{
+      font-size:12px; fill:var(--ink);
+      text-anchor:middle; dominant-baseline:hanging; pointer-events:none;
+    }
+    .person .sub{ font-size:10.5px; fill:var(--ink-soft); }
+
+    /* Marker indicating genetic test result.  A small '+' or '−' is drawn
+       just above each individual to show whether they carry the familial
+       mutation.  A '+' denotes a mutation carrier (gtest:'positive') and
+       uses the positive colour, while a '−' denotes a wild‑type result
+       (gtest:'negative') and uses the negative colour.  Unknown results
+       omit the marker entirely.  The font size and weight ensure the
+       symbol remains legible without dominating the node. */
+    .marker{ font-size:14px; font-weight:bold; pointer-events:none;
+      text-anchor:middle; dominant-baseline:baseline; }
+    .marker.positive{ fill:var(--positive); }
+    .marker.negative{ fill:var(--negative); }
+    .marker.unknown{ fill:var(--unknown); }
+
+    /* Status colouring: use a single clear convention rather than multiple
+       outline colours.  Individuals with a positive/affected status will
+       have their shape filled with the positive colour.  Unaffected and
+       unknown individuals keep the default white fill and dark border.
+       Carriers are indicated via half or hatched fills. */
+    .affected .shape{ fill:var(--positive); stroke:var(--positive); }
+    .unknown .shape{ fill:#ffffff; stroke:var(--ink); opacity:0.8; }
+
+    .carrier-half .carrier-fill{ fill:var(--carrier-fill); opacity:.9; }
+    .carrier-hatch .carrier-fill{ fill:url(#hatch); opacity:.95; }
+
+    .inherit-AD .marriage, .inherit-AD .sibline, .inherit-AD .drop{ stroke:#f59e0b; }
+    .inherit-AR .marriage, .inherit-AR .sibline, .inherit-AR .drop{ stroke:#3b82f6; }
+    .inherit-XL .marriage, .inherit-XL .sibline, .inherit-XL .drop{ stroke:#a855f7; }
+
+    .selected .shape{ filter: drop-shadow(0 0 8px #38bdf8aa); }
+
+    /* Compact mode at far zoom-out: hide sub labels to keep chart clean */
+    .compact .person .sub{ display:none; }
+
+    /* Responsive: stack editor under chart on small screens */
+    @media (max-width: 1100px){
+      .app{ grid-template-columns: 1fr; grid-template-areas: "header" "chart" "side" "footer"; }
+      aside{ max-height:42vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app inherit-AD" id="app">
+    <!-- ===== Toolbar ===== -->
+    <header role="toolbar" aria-label="Pedigree toolbar" id="toolbar">
+      <!-- Primary actions -->
+      <div class="group group--primary">
+        <button class="btn" data-action="toggle-editor" aria-label="Show or hide editor">Toggle Editor</button>
+        <button class="btn" data-action="add-founder">Add Founder</button>
+        <button class="btn" data-action="add-partner" title="For selected person">Add Partner</button>
+        <button class="btn" data-action="add-child" title="For selected marriage or person with partner">Add Child</button>
+        <button class="btn" data-action="delete">Delete</button>
+      </div>
+
+      <!-- Options -->
+      <div class="group group--options">
+        <label>Inheritance:
+          <select id="inherit-model" aria-label="Inheritance model">
+            <option value="AD" selected>Autosomal Dominant (AD)</option>
+            <option value="AR">Autosomal Recessive (AR)</option>
+            <option value="XL">X-linked (XL)</option>
+          </select>
+        </label>
+        <label>Gender label:
+          <select id="gender-label-mode" aria-label="Gender label mode">
+            <option value="shape" selected>Shape only</option>
+            <option value="shape+symbol">Shape + ♂/♀/◇</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="spacer" aria-hidden="true"></div>
+
+      <!-- Secondary & Export (visible on wide screens) -->
+      <div class="group group--secondary">
+        <button class="btn" data-action="save">Save</button>
+        <button class="btn" data-action="load">Load</button>
+        <button class="btn" data-action="reset">Reset</button>
+      </div>
+      <div class="group group--export">
+        <button class="btn" data-action="export-png">Export PNG</button>
+        <button class="btn" data-action="export-pdf">Export PDF</button>
+      </div>
+
+      <!-- Overflow menu for small screens -->
+      <details class="more">
+        <summary class="btn" aria-label="More actions">More ▾</summary>
+        <div class="menu" role="menu" aria-label="More actions">
+          <div class="section">Data</div>
+          <div class="row">
+            <button class="btn" data-action="save">Save</button>
+            <button class="btn" data-action="load">Load</button>
+            <button class="btn" data-action="reset">Reset</button>
+          </div>
+          <div class="section">Export</div>
+          <div class="row">
+            <button class="btn" data-action="export-png">PNG</button>
+            <button class="btn" data-action="export-pdf">PDF</button>
+          </div>
+        </div>
+      </details>
+    </header>
+
+    <!-- ===== Editor ===== -->
+    <aside id="editor">
+      <h3>Person Editor</h3>
+      <div class="field"><label>ID</label><input id="f-id" disabled /></div>
+      <div class="row">
+        <div class="field"><label>Name</label><input id="f-name" placeholder="Full name" /></div>
+        <div class="field"><label>Sex</label>
+          <select id="f-sex">
+            <option value="M">Male (□)</option>
+            <option value="F">Female (○)</option>
+            <option value="U">Unknown (◇)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field"><label>DOB</label><input id="f-dob" placeholder="YYYY-MM-DD" /></div>
+        <div class="field"><label>DOD</label><input id="f-dod" placeholder="YYYY-MM-DD" /></div>
+      </div>
+      <div class="field"><label>Genetic Variant</label><input id="f-variant" placeholder="e.g., BRCA1 c.5266dupC" /></div>
+      <div class="row">
+        <div class="field"><label>Age at Diagnosis</label><input id="f-ageDx" type="number" min="0" /></div>
+        <div class="field"><label>Age at Death</label><input id="f-ageDeath" type="number" min="0" /></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Carrier</label>
+          <select id="f-carrier">
+            <option value="none">No</option>
+            <option value="half">Half-shaded</option>
+            <option value="hatch">Hatched</option>
+          </select>
+        </div>
+        <div class="field"><label>Genetic Test</label>
+          <select id="f-gtest">
+            <option value="unknown">Unknown</option>
+            <option value="negative">Negative</option>
+            <option value="positive">Positive</option>
+          </select>
+        </div>
+      </div>
+      <div class="field"><label>Notes</label><textarea id="f-notes" rows="3" placeholder="Clinical notes..."></textarea></div>
+      <button class="btn" id="btn-apply">Apply Changes</button>
+
+      <!-- Members list: shows all individuals in the pedigree along with their
+           Roman enumeration (or name), sex symbol and genetic test marker.  Clicking
+           on a person in this list selects them in the chart and opens the editor.
+           This list is dynamically populated by updateMemberList(). -->
+      <div class="member-list-section" style="margin-top:1.2rem;">
+        <h3 style="margin-bottom:.4rem; font-size:1.05rem;">Members</h3>
+        <ul id="member-list" style="list-style:none; padding-left:0; margin:0; max-height:200px; overflow:auto; font-size:.9rem;">
+          <!-- entries inserted dynamically -->
+        </ul>
+      </div>
+    </aside>
+
+    <!-- ===== Chart ===== -->
+    <div id="chart-wrap">
+      <svg id="svg" role="img" aria-label="Clinical pedigree diagram">
+        <defs>
+          <!-- Hatch pattern for carriers -->
+          <pattern id="hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="6" stroke="#94a3b8" stroke-width="2"></line>
+          </pattern>
+        </defs>
+        <rect class="overlay" x="-10000" y="-10000" width="20000" height="20000"></rect>
+        <g id="root" tabindex="0">
+          <g id="edges"></g>
+          <g id="marriages"></g>
+          <g id="nodes"></g>
+        </g>
+      </svg>
+    </div>
+
+    <!-- ===== Footer ===== -->
+    <footer>
+      <div class="legend">
+        <span class="key"><span class="dot" style="border-radius:2px;"></span> Male (□)</span>
+        <span class="key"><span class="dot" style="border-radius:50%"></span> Female (○)</span>
+        <span class="key"><span class="dot" style="clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%)"></span> Unknown (◇)</span>
+        <span class="key"><span class="dot" style="background:var(--carrier-fill)"></span> Carrier</span>
+        <span class="key"><span class="dot" style="background:none;border:2px solid var(--positive)"></span> Test +</span>
+        <span class="key"><span class="dot" style="background:none;border:2px solid var(--negative)"></span> Test −</span>
+      </div>
+      <div>Zoom: scroll/drag · Double‑click a marriage line to add child</div>
+    </footer>
+  </div>
+
+<script>
+/* ===========================
+   State, model, utilities
+=========================== */
+const state = {
+  persons: new Map(),      // id -> person
+  marriages: new Map(),    // id -> {id, partners:[a,b], children:[]}
+  selected: { type:null, id:null },
+  inheritModel: 'AD',
+  genderLabelMode: 'shape',
+  _userZoomed: false,
+};
+
+// id generator
+const uid = (p='id') => p + Math.random().toString(36).slice(2,9);
+
+// Sample data (3 generations)
+function seedSample(){
+  const A = addPerson({name:'Ali',   sex:'M', dob:'1955-01-02'});
+  const B = addPerson({name:'Zahra', sex:'F', dob:'1957-06-11', carrier:'half', gtest:'positive', variant:'BRCA1 c.5266dupC'});
+  const m1 = addMarriage(A, B);
+  const C = addPerson({name:'Maryam', sex:'F', dob:'1982-03-02', gtest:'negative'});
+  const D = addPerson({name:'Hossein', sex:'M', dob:'1984-04-12'});
+  linkChild(m1, C); linkChild(m1, D);
+
+  const E = addPerson({name:'Sara', sex:'F', dob:'1985-10-10', carrier:'hatch', gtest:'unknown'});
+  const m2 = addMarriage(D, E);
+  const F = addPerson({name:'Reza', sex:'M', dob:'2010-05-14'});
+  const G = addPerson({name:'Reihaneh', sex:'F', dob:'2014-07-22'});
+  linkChild(m2, F); linkChild(m2, G);
+
+  const H = addPerson({name:'Unknown', sex:'U', dob:'–'});
+  const m3 = addMarriage(C, H);
+  const I = addPerson({name:'Nastaran', sex:'F', dob:'2012-01-01', gtest:'positive', ageDx:28});
+  linkChild(m3, I);
+}
+
+// Seed pedigree based on uploaded image.
+// This function constructs a pedigree matching the provided picture.  It clears
+// existing state and then adds individuals, marriages and offspring according to the
+// diagram.  Carriers are indicated via the `carrier` property ('half' for partial fill,
+// 'hatch' for hatched fill), and affected individuals are marked with gtest:'positive'.
+function seedFromImage(){
+  // Clear any existing persons and marriages
+  state.persons.clear();
+  state.marriages.clear();
+  state.selected = { type:null, id:null };
+  /*
+    Sample pedigree based loosely on a complex multi‑generation family tree.  The
+    structure approximates the uploaded chart by including five
+    generations with multiple branches, carriers and affected individuals.
+    Each person is annotated with their generation and order in the name
+    (e.g. "III2‑2"), and carriers are marked using a hatched fill.  Affected
+    individuals have gtest:'positive'.  Unaffected individuals have
+    gtest:'negative' or are left as default (unknown) to remain open.
+    This sample is provided as a starting point and can be modified via
+    the UI.
+  */
+  // Generation I: a single couple
+  const I1 = addPerson({name:'I-1', sex:'M', gtest:'negative'});
+  const I2 = addPerson({name:'I-2', sex:'F', gtest:'negative'});
+  const m1 = addMarriage(I1, I2);
+
+  // Generation II: four children of I‑1 and I‑2
+  const II1 = addPerson({name:'II-1', sex:'M', gtest:'negative'});
+  const II2 = addPerson({name:'II-2', sex:'M', gtest:'positive'}); // affected son
+  const II3 = addPerson({name:'II-3', sex:'M', gtest:'negative'});
+  const II4 = addPerson({name:'II-4', sex:'M', gtest:'negative'});
+  linkChild(m1, II1);
+  linkChild(m1, II2);
+  linkChild(m1, II3);
+  linkChild(m1, II4);
+  // Spouses for generation II
+  const II1_sp = addPerson({name:'II1-sp', sex:'F', gtest:'negative'});
+  const m2 = addMarriage(II1, II1_sp);
+  const II2_sp = addPerson({name:'II2-sp', sex:'F', gtest:'negative'});
+  const m3 = addMarriage(II2, II2_sp);
+  const II3_sp = addPerson({name:'II3-sp', sex:'F', gtest:'negative'});
+  const m4 = addMarriage(II3, II3_sp);
+  const II4_sp = addPerson({name:'II4-sp', sex:'F', gtest:'negative'});
+  const m5 = addMarriage(II4, II4_sp);
+
+  // Generation III: children of II‑2 (one carrier, one obligate carrier, one affected)
+  const III2_1 = addPerson({name:'III2-1', sex:'F', carrier:'half'}); // carrier daughter (+)
+  const III2_2 = addPerson({name:'III2-2', sex:'M', carrier:'half'}); // obligate carrier son (+)
+  const III2_3 = addPerson({name:'III2-3', sex:'M', gtest:'positive'}); // affected son (filled)
+  linkChild(m3, III2_1);
+  linkChild(m3, III2_2);
+  linkChild(m3, III2_3);
+  // Spouse for III2-2
+  const III2_2_sp = addPerson({name:'III2-2-sp', sex:'F', gtest:'negative'});
+  const m6 = addMarriage(III2_2, III2_2_sp);
+
+  // Generation IV: children of III2‑2 and spouse (one affected, one unaffected)
+  const IV1 = addPerson({name:'IV-1', sex:'M', gtest:'positive'});
+  const IV2 = addPerson({name:'IV-2', sex:'F', gtest:'negative'});
+  linkChild(m6, IV1);
+  linkChild(m6, IV2);
+  // Spouse for IV-1 and their child (generation V)
+  const IV1_sp = addPerson({name:'IV1-sp', sex:'F', gtest:'negative'});
+  const m7 = addMarriage(IV1, IV1_sp);
+  const V1 = addPerson({name:'V-1', sex:'M', gtest:'negative'});
+  linkChild(m7, V1);
+}
+
+function addPerson(p){
+  const id = p.id || uid('P_');
+  state.persons.set(id, {
+    id, name:'', sex:'U', dob:'', dod:'', ageDx:null, ageDeath:null,
+    variant:'', gtest:'unknown', carrier:'none', notes:'',
+    ...p, marriages:[]
+  });
+  return id;
+}
+function addMarriage(p1, p2){
+  const id = uid('M_');
+  state.marriages.set(id, { id, partners:[p1,p2], children:[] });
+  state.persons.get(p1).marriages.push(id);
+  state.persons.get(p2).marriages.push(id);
+  return id;
+}
+function linkChild(mId, childId){
+  const m = state.marriages.get(mId);
+  if(!m.children.includes(childId)) m.children.push(childId);
+}
+function deleteSelected(){
+  const sel = state.selected;
+  if(!sel.id) return;
+  // Helper to detach a marriage: removes it from partners and deletes the marriage.
+  function detachMarriage(mid){
+    const m = state.marriages.get(mid);
+    if(!m) return;
+    // Remove this marriage from the partners' marriage lists
+    m.partners.forEach(pid => {
+      const person = state.persons.get(pid);
+      if(person){
+        person.marriages = person.marriages.filter(x => x !== mid);
+      }
+    });
+    // Remove the marriage itself. Children remain unattached and become roots.
+    state.marriages.delete(mid);
+  }
+  if(sel.type === 'person'){
+    const p = state.persons.get(sel.id);
+    if(!p) return;
+    // Remove this person from any parents' children lists
+    state.marriages.forEach((m) => {
+      m.children = m.children.filter(cid => cid !== p.id);
+    });
+    // Detach all marriages of this person.  Their children will remain but become new roots.
+    p.marriages.forEach(mid => {
+      detachMarriage(mid);
+    });
+    // Finally delete the person
+    state.persons.delete(p.id);
+  } else if(sel.type === 'marriage'){
+    const m = state.marriages.get(sel.id);
+    if(!m) return;
+    // Detach this marriage. Children become new roots.
+    detachMarriage(m.id);
+  }
+  state.selected = {type:null, id:null};
+  render();
+}
+
+/* ===========================
+   Layout (overlap-free, symmetric siblings)
+=========================== */
+const layout = {
+  nodeW: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--node-w')),
+  nodeH: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--node-h')),
+  genGap: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--gen-gap')),
+  sibGap: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sib-gap')),
+  spouseGap: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--spouse-gap')),
+};
+
+function buildIndexes(){
+  const childOf = new Map(); // child -> parents marriage
+  state.marriages.forEach(m => m.children.forEach(c => childOf.set(c, m.id)));
+  return { childOf };
+}
+
+function computeGenerations(){
+  const { childOf } = buildIndexes();
+  const gen = new Map();
+  const q = [];
+
+  // Founders
+  state.persons.forEach((p, id)=>{ if(!childOf.has(id)) { gen.set(id, 0); q.push(id); } });
+
+  function pushReadyMarriages(){
+    state.marriages.forEach(m=>{
+      if(gen.has(m.id)) return;
+      const g0 = gen.get(m.partners[0]);
+      const g1 = gen.get(m.partners[1]);
+      if(g0!=null && g1!=null){ gen.set(m.id, Math.max(g0,g1)); q.push(m.id); }
+    });
+  }
+  pushReadyMarriages();
+
+  // BFS
+  while(q.length){
+    const id = q.shift();
+    if(state.marriages.has(id)){
+      const mg = gen.get(id);
+      state.marriages.get(id).children.forEach(cid=>{
+        if(!gen.has(cid)){ gen.set(cid, mg+1); q.push(cid); }
+      });
+    } else {
+      pushReadyMarriages();
+    }
+  }
+
+  // Fallbacks
+  state.persons.forEach((p,id)=>{ if(!gen.has(id)) gen.set(id, 0); });
+  state.marriages.forEach((m,id)=>{
+    if(!gen.has(id)){
+      const g0 = gen.get(m.partners[0])||0, g1 = gen.get(m.partners[1])||0;
+      gen.set(id, Math.max(g0,g1));
+    }
+  });
+  return gen;
+}
+
+function computePositions(){
+  const gen = computeGenerations();
+  const byGen = new Map();
+  function addGen(id,g){ if(!byGen.has(g)) byGen.set(g, []); byGen.get(g).push(id); }
+
+  state.persons.forEach((p,id)=> addGen(id, gen.get(id)));
+  state.marriages.forEach((m,id)=> addGen(id, gen.get(id)));
+
+  const primaryMarriage = new Map();
+  // For each person record the first marriage in their list as their
+  // primary marriage.  Subsequent marriages are treated as secondary
+  // unions and are intentionally not anchored to the individual.  This
+  // allows multiple marriages to start their own subtrees rather than
+  // pulling the person back to a single horizontal position.  See
+  // user request: multi‑partner relationships should branch into
+  // separate pedigrees rather than forming a single connected cluster.
+  state.persons.forEach(p => {
+    const first = (p.marriages && p.marriages.length) ? p.marriages[0] : null;
+    primaryMarriage.set(p.id, first);
+  });
+
+  const cacheW = new Map();
+  const nodeWidth = ()=> layout.nodeW + 20;
+
+  function subtreeWidthForPerson(pid){
+    const pm = primaryMarriage.get(pid);
+    if(pm) return subtreeWidthForMarriage(pm);
+    return nodeWidth();
+  }
+  function subtreeWidthForMarriage(mid){
+    if(cacheW.has(mid)) return cacheW.get(mid);
+    const m = state.marriages.get(mid);
+    if(!m) return nodeWidth()*2 + layout.spouseGap;
+    if(!m.children.length){
+      const w = nodeWidth()*2 + layout.spouseGap;
+      cacheW.set(mid, w); return w;
+    }
+    let w = 0;
+    m.children.forEach((cid, i)=>{
+      w += subtreeWidthForPerson(cid);
+      if(i < m.children.length-1) w += layout.sibGap;
+    });
+    cacheW.set(mid, w);
+    return w;
+  }
+
+  const pos = new Map();
+
+  const gens = Array.from(byGen.keys()).sort((a,b)=>a-b);
+  const yOf = id => (gen.get(id) * layout.genGap);
+  const xCursorByGen = new Map(gens.map(g=>[g, 40]));
+
+  function placeMarriage(mid, xStart){
+    const m = state.marriages.get(mid);
+    const y = yOf(mid);
+    const W = subtreeWidthForMarriage(mid);
+    const xCenter = xStart + W/2;
+
+    // spouses centers
+    const lx = xCenter - layout.spouseGap/2 - layout.nodeW/2;
+    const rx = xCenter + layout.spouseGap/2 + layout.nodeW/2;
+
+    // Position partners.  Only update a partner's coordinates if this
+    // marriage is their primary marriage or if they have not yet been
+    // positioned.  Avoid overwriting an existing position for secondary
+    // marriages so that individuals with multiple marriages remain at
+    // the coordinates determined by their primary union.
+    const pid0 = m.partners[0];
+    const pid1 = m.partners[1];
+    if(!pos.has(pid0) || primaryMarriage.get(pid0) === mid){
+      pos.set(pid0, {x: lx, y, type:'person'});
+    }
+    if(!pos.has(pid1) || primaryMarriage.get(pid1) === mid){
+      pos.set(pid1, {x: rx, y, type:'person'});
+    }
+    // Always position the marriage itself at the computed centre.  This
+    // entry is used to derive the vertical drop for children regardless
+    // of whether the partners have been anchored.
+    pos.set(mid, {x: xCenter, y, type:'marriage'});
+
+    // children
+    let childStart = xStart;
+    // If there is exactly one child, centre the child beneath the parents.
+    if(m.children.length === 1){
+      const cid = m.children[0];
+      const pm = primaryMarriage.get(cid);
+      // Centre the child's subtree on the marriage's centre.
+      if(pm){
+        // When the child has its own marriage, place that marriage so that its centre aligns with xCenter.
+        const childWidth = subtreeWidthForMarriage(pm);
+        const childXStart = xCenter - childWidth / 2;
+        placeMarriage(pm, childXStart);
+        pos.set(cid, {x: xCenter, y: y + layout.genGap, type:'person'});
+      } else {
+        pos.set(cid, {x: xCenter, y: y + layout.genGap, type:'person'});
+      }
+    } else {
+      m.children.forEach((cid, i)=>{
+        const w = subtreeWidthForPerson(cid);
+        const cx = childStart + w/2;
+        const pm = primaryMarriage.get(cid);
+        if(pm){
+          placeMarriage(pm, childStart);
+          pos.set(cid, {x: pos.get(pm).x, y: y + layout.genGap, type:'person'});
+        } else {
+          pos.set(cid, {x: cx, y: y + layout.genGap, type:'person'});
+        }
+        childStart += w + layout.sibGap;
+      });
+    }
+  }
+
+  // place marriages then singles per generation
+  gens.forEach(g=>{
+    // First, process marriages in this generation.  If a marriage shares a
+    // partner with an already placed marriage, align its centre on the
+    // existing partner's x coordinate to keep that person in one place.  This
+    // prevents repositioning of individuals when they have multiple
+    // marriages and more closely matches classical pedigree layouts.
+    const mids = Array.from(state.marriages.keys()).filter(mid => gen.get(mid)===g);
+    mids.forEach(mid=>{
+      if(pos.has(mid)) return;
+      const m = state.marriages.get(mid);
+      let anchorIndex = null;
+      let anchorX = null;
+      // Determine if one of the partners has already been positioned.  Only
+      // anchor the marriage to a partner if this marriage is that partner's
+      // primary marriage.  Secondary marriages are placed as independent
+      // subtrees (new roots) without reusing the person's x coordinate.
+      m.partners.forEach((pid, idx) => {
+        if (anchorIndex === null && pos.has(pid)) {
+          // Only anchor if this marriage is the primary marriage for this person
+          if (primaryMarriage.get(pid) === m.id) {
+            anchorIndex = idx;
+            anchorX = pos.get(pid).x;
+          }
+        }
+      });
+      let xStart;
+      const W = subtreeWidthForMarriage(mid);
+      if(anchorIndex !== null){
+        // Align the marriage centre based on the anchored partner's position
+        let xCenter;
+        if(anchorIndex === 0){
+          // partner[0] should remain at anchorX; compute centre accordingly
+          xCenter = anchorX + (layout.spouseGap/2) + (layout.nodeW/2);
+        } else {
+          // partner[1] anchored; compute centre
+          xCenter = anchorX - (layout.spouseGap/2) - (layout.nodeW/2);
+        }
+        xStart = xCenter - W/2;
+      } else {
+        // No anchor; place sequentially
+        xStart = xCursorByGen.get(g);
+        xCursorByGen.set(g, xStart + W + 60);
+      }
+      placeMarriage(mid, xStart);
+    });
+
+    // Singles (individuals without any marriage in this generation)
+    const singles = Array.from(state.persons.keys())
+      .filter(pid => gen.get(pid)===g && !primaryMarriage.get(pid));
+    singles.forEach(pid=>{
+      // Avoid placing singles twice if they have been anchored by a marriage
+      if(pos.has(pid)) return;
+      const x = xCursorByGen.get(g) + layout.nodeW/2;
+      pos.set(pid, {x, y: yOf(pid), type:'person'});
+      xCursorByGen.set(g, x + layout.nodeW/2 + 60);
+    });
+  });
+
+  // After positions are computed, shift the entire pedigree left so that
+  // there is no excessive blank space on the left.  We compute the
+  // minimum x coordinate of all positioned nodes and shift the
+  // pedigree by a constant so that the leftmost node sits at a
+  // predefined margin.  This reduces horizontal scrolling and makes
+  // better use of the available canvas.
+  const xs = Array.from(pos.values()).map(p => p.x);
+  if(xs.length){
+    const minX = Math.min(...xs);
+    const desiredMargin = 40; // leave a small margin on the left
+    const shift = desiredMargin - minX;
+    pos.forEach(p => { p.x += shift; });
+  }
+
+  return { pos, gen, primaryMarriage };
+}
+
+/* ===========================
+   Render with D3
+=========================== */
+const svg = d3.select('#svg');
+const gRoot = d3.select('#root');
+const gEdges = d3.select('#edges');
+const gMarriages = d3.select('#marriages');
+const gNodes = d3.select('#nodes');
+
+const zoom = d3.zoom().scaleExtent([0.3, 3]).on('zoom', (ev)=>{
+  state._userZoomed = true;
+  gRoot.attr('transform', ev.transform);
+  svg.classed('compact', ev.transform.k < 0.65); // hide sub labels when too small
+});
+svg.call(zoom);
+
+// Clear selection when clicking background
+svg.on('click', (ev)=>{
+  if(ev.target.closest('.person, .marriage-line, .sibline')) return;
+  state.selected = {type:null, id:null};
+  updateEditor(null);
+  render();
+});
+
+// Wrap/ellipsis for SVG <text> using tspans
+function wrapText(selection, width, maxLines=2, lineHeight=1.15){
+  selection.each(function(){
+    const text = d3.select(this);
+    const raw = (text.text() || '').trim();
+    text.text(null);
+    if(!raw) return;
+
+    const words = raw.split(/\s+/);
+    let line = [], lineNumber = 0;
+    let tspan = text.append('tspan').attr('x', 0).attr('dy', '0em');
+
+    for(let i=0; i<words.length; i++){
+      line.push(words[i]);
+      tspan.text(line.join(' '));
+      if (tspan.node().getComputedTextLength() > width){
+        // Single long word → hard wrap
+        if(line.length === 1 && words[i].length > 0){
+          let word = words[i], chunk = '';
+          line.pop(); tspan.text(line.join(' '));
+          while(word.length){
+            chunk += word[0];
+            tspan.text((line.join(' ') + ' ' + chunk).trim());
+            if (tspan.node().getComputedTextLength() > width) {
+              chunk = chunk.slice(0,-1);
+              tspan.text((line.join(' ') + ' ' + chunk).trim());
+              lineNumber++;
+              if(lineNumber >= maxLines){
+                tspan.text(tspan.text().replace(/\s*$/, '') + '…'); return;
+              }
+              word = word.slice(chunk.length);
+              tspan = text.append('tspan').attr('x',0).attr('dy', lineHeight+'em').text('');
+              chunk = '';
+            } else {
+              word = word.slice(1);
+            }
+          }
+          line = [];
+          continue;
+        }
+        line.pop();
+        tspan.text(line.join(' '));
+        line = [words[i]];
+        lineNumber++;
+        if(lineNumber >= maxLines){
+          tspan.text(tspan.text().replace(/\s*$/, '') + '…'); return;
+        }
+        tspan = text.append('tspan').attr('x', 0).attr('dy', lineHeight+'em').text(words[i]);
+      }
+    }
+  });
+}
+
+// Render
+function render(){
+  const { pos, gen } = computePositions();
+
+  // Assign Roman numeral labels to each person based on their generation and
+  // horizontal order.  This allows displaying identifiers like "I-1",
+  // "II-3", etc. similar to the example diagram.  Roman numerals are
+  // derived from the generation index (0 → I, 1 → II, etc.) and the
+  // individuals within each generation are numbered left‑to‑right based on
+  // their x position.
+  (function assignRomanLabels(){
+    /*
+      Assign generation labels using the visual row of each person rather than
+      their genealogical depth.  The original implementation based labels
+      purely on computed generations, which led to confusing labels when
+      individuals were visually shifted into a different row (for example,
+      founders married to a descendant were drawn on the descendant's row).
+      To align the labels with what the viewer sees, we derive the row index
+      from the y‑coordinate of each person.  We then group people by this
+      visual row and number them left‑to‑right.  Roman numerals are used
+      for the row number (I=first row, II=second, etc.).
+    */
+    const romanSymbols = ['I','II','III','IV','V','VI','VII','VIII','IX','X'];
+    const groups = new Map();
+    state.persons.forEach((p,id) => {
+      const pPos = pos.get(id);
+      if(!pPos) return;
+      // derive row index based on y position and vertical gap; round to nearest int
+      const row = Math.round(pPos.y / layout.genGap);
+      if(!groups.has(row)) groups.set(row, []);
+      groups.get(row).push(id);
+    });
+    groups.forEach((ids, row) => {
+      ids.sort((a,b) => (pos.get(a)?.x||0) - (pos.get(b)?.x||0));
+      ids.forEach((id, idx) => {
+        const romanGen = romanSymbols[row] || (row+1).toString();
+        state.persons.get(id).roman = romanGen + '-' + (idx+1);
+      });
+    });
+  })();
+
+  // theme by inheritance model
+  const app = document.getElementById('app');
+  app.classList.remove('inherit-AD','inherit-AR','inherit-XL');
+  app.classList.add('inherit-'+state.inheritModel);
+
+  // ===== marriages =====
+  // Use drawLines() to render marriage connections asynchronously after layout.
+  setTimeout(() => drawLines(pos), 0);
+  if(false){
+  const marriages = Array.from(state.marriages.values());
+  const mSel = gMarriages.selectAll('g.marriage').data(marriages, d=>d.id);
+  const mEnter = mSel.enter().append('g').attr('class','marriage');
+  mEnter.append('line').attr('class','marriage-line');
+  mEnter.append('line').attr('class','drop');
+  mEnter.append('line').attr('class','sibline');
+
+  const mAll = mEnter.merge(mSel);
+  mAll.each(function(m){
+    const g = d3.select(this);
+    const a = pos.get(m.partners[0]), b = pos.get(m.partners[1]);
+    const y = a.y;
+
+    // marriage line endpoints: touch node edges (no overlap).  Attach
+    // click handler to allow selection.
+    g.select('.marriage-line')
+      .attr('x1', a.x + (layout.nodeW/2)*Math.sign(b.x-a.x))
+      .attr('y1', y)
+      .attr('x2', b.x - (layout.nodeW/2)*Math.sign(b.x-a.x))
+      .attr('y2', y)
+      .attr('stroke-width', 3)
+      .on('click', (ev)=>{ ev.stopPropagation(); selectItem('marriage', m.id); });
+
+    // midpoint of the two partners.  We will adjust the drop location
+    // when there is exactly one child so that the vertical drop aligns
+    // with that child.  Without this adjustment a single child will
+    // create an extra horizontal stub between the drop and the child's
+    // vertical edge.  See Issue: orange stub under II‑2/II‑3 in sample.
+    const mx = (a.x + b.x)/2;
+    // Determine the baseline for siblings below the parents.  Instead of
+    // hard‑coding a constant, base the offset on the node height and a
+    // small margin.  This improves vertical spacing when the node
+    // dimensions change.  We use half the node height plus a 12px
+    // additional margin.  You can adjust this margin to fine‑tune the
+    // distance between parent and children rows.
+    const sibY = y + (layout.nodeH/2) + 12;
+    // If there is exactly one child, align the vertical drop over that
+    // child’s x coordinate.  Otherwise centre the drop between the
+    // partners.  Aligning the drop prevents a visible horizontal stub
+    // connecting the drop and the child’s vertical edge.
+    let dropX = mx;
+    if (m.children && m.children.length === 1) {
+      const onlyChild = pos.get(m.children[0]);
+      if (onlyChild) dropX = onlyChild.x;
+    }
+    g.select('.drop')
+      .attr('x1', dropX).attr('y1', y)
+      .attr('x2', dropX).attr('y2', sibY);
+
+    /*
+      When rendering the horizontal sibling line, use a single point when
+      there is only one child.  In earlier versions the code drew a
+      horizontal stub even for single‑child families, which created
+      confusing extra lines that looked like additional siblings.  To
+      correct this, we treat single children specially by collapsing
+      the sibline to a point at the child's x position.  For larger
+      families we draw the line between the first and last child with
+      a small pad on either side.
+    */
+    if (m.children.length === 1) {
+      const childX = pos.get(m.children[0]).x;
+      // Hide the drop line for a single child.  By collapsing the drop to
+      // zero length and setting its stroke width to zero we create a gap
+      // between the parents' marriage line and the child's branch.  This
+      // visually separates the single‑child branch from the line
+      // connecting the parents, addressing the user’s request to detach
+      // the child’s branch from the parental connection line.
+      g.select('.drop')
+        .attr('x1', childX)
+        .attr('y1', sibY)
+        .attr('x2', childX)
+        .attr('y2', sibY)
+        .attr('stroke-width', 0);
+      // Collapse the sibline to a single point for one child and hide it.
+      g.select('.sibline')
+        .attr('x1', childX)
+        .attr('y1', sibY)
+        .attr('x2', childX)
+        .attr('y2', sibY)
+        .attr('stroke-width', 0);
+      // Draw a single vertical edge from the collapsed sibline to the child
+      const lines = g.selectAll('line.edge').data(m.children, d => d);
+      lines.join(
+        enter => enter.append('line').attr('class', 'edge'),
+        update => update,
+        exit => exit.remove()
+      )
+      .attr('x1', childX)
+      .attr('x2', childX)
+      .attr('y1', sibY)
+      .attr('y2', d => pos.get(d).y - layout.nodeH / 2);
+    } else if (m.children.length > 1) {
+      const firstX = pos.get(m.children[0]).x;
+      const lastX  = pos.get(m.children[m.children.length - 1]).x;
+      const pad = layout.nodeW * 0.35;
+      g.select('.sibline')
+        .attr('x1', firstX - pad)
+        .attr('y1', sibY)
+        .attr('x2', lastX + pad)
+        .attr('y2', sibY);
+
+      const lines = g.selectAll('line.edge').data(m.children, d => d);
+      lines.join(
+        enter => enter.append('line').attr('class', 'edge'),
+        update => update,
+        exit => exit.remove()
+      )
+      .attr('x1', d => pos.get(d).x)
+      .attr('x2', d => pos.get(d).x)
+      .attr('y1', sibY)
+      .attr('y2', d => pos.get(d).y - layout.nodeH / 2);
+    } else {
+      // no children: collapse the sibline
+      g.select('.sibline')
+        .attr('x1', mx)
+        .attr('x2', mx)
+        .attr('y1', sibY)
+        .attr('y2', sibY);
+      g.selectAll('line.edge').remove();
+    }
+  });
+  mSel.exit().remove();
+  }
+
+  // ===== persons =====
+  const persons = Array.from(state.persons.values());
+  const nodeSel = gNodes.selectAll('g.person').data(persons, d=>d.id);
+
+  const nodeEnter = nodeSel.enter().append('g').attr('class','person')
+        .on('click', (ev,d)=>{ ev.stopPropagation(); selectItem('person', d.id); });
+  nodeEnter.append('g').attr('class','glyph');
+  nodeEnter.append('g').attr('class','carrier');
+  nodeEnter.append('text').attr('class','label name');
+  nodeEnter.append('text').attr('class','label sub');
+  // Marker element for genetic test result.  This text element sits above
+  // the glyph and displays '+' for mutation carriers (gtest:'positive') or
+  // '−' for wild‑type individuals (gtest:'negative').  Unknown results
+  // leave the marker empty.  The marker inherits styling from CSS via
+  // class names assigned below.
+  nodeEnter.append('text').attr('class','marker');
+
+  const nodeAll = nodeEnter.merge(nodeSel);
+  nodeAll
+    .classed('selected', d=>state.selected.type==='person' && state.selected.id===d.id)
+    .each(function(d){
+      const g = d3.select(this);
+      const p = pos.get(d.id);
+      if(!p) return;
+      g.attr('transform', `translate(${p.x},${p.y})`);
+
+      // Determine whether this person should be styled as affected or unknown.
+      // Carriers retain their carrier fill and are not additionally filled as
+      // affected.  Unknowns (neither positive nor negative) get a muted style.
+      const isAffected = d.gtest==='positive';
+      const isCarrier = d.carrier && d.carrier!=='none';
+      g.classed('affected', isAffected && !isCarrier)
+       .classed('unknown', !isAffected && d.gtest!=='negative');
+
+      drawSexShape(g.select('g.glyph'), d);
+      drawCarrierFill(g.select('g.carrier'), d);
+
+      // === Genetic test marker ===
+      // Determine marker text and class based on the gtest property.
+      const marker = g.select('text.marker');
+      let markerText = '';
+      let markerClass = 'unknown';
+      if(d.gtest === 'positive'){
+        markerText = '+';
+        markerClass = 'positive';
+      } else if(d.gtest === 'negative'){
+        markerText = '−';
+        markerClass = 'negative';
+      }
+      marker
+        .text(markerText)
+        .attr('class', 'marker ' + markerClass)
+        // Position the marker just above the glyph.  Use the node height
+        // defined in the layout to compute an offset; an extra margin of
+        // 8px provides breathing room.
+        .attr('x', 0)
+        .attr('y', -layout.nodeH/2 - 8);
+
+      // === Labels (no overlap) ===
+      const symbol = d.sex==='M'?'♂':(d.sex==='F'?'♀':'◇');
+      const showSymbol = (state.genderLabelMode==='shape+symbol') ? (' ' + symbol) : '';
+
+      // Determine the primary label: use Roman enumeration if available, otherwise the provided name
+      const label = d.roman || d.name || 'Unnamed';
+      const nameSel = g.select('text.name')
+        // Position the label in the vertical centre of the glyph
+        .attr('y', 0)
+        .attr('dy', '.35em')
+        .attr('font-family', state.genderLabelMode==='shape+symbol'
+              ? 'var(--font), var(--font-symbol)' : 'var(--font)')
+        .attr('font-size', 12)
+        .text(label + showSymbol);
+
+      // For the Roman‑enumeration style, suppress sub‑labels to avoid clutter.
+      g.select('text.sub').text('');
+    });
+
+  nodeSel.exit().remove();
+
+  // Zoom-to-fit when the user hasn't manually zoomed
+  if(!state._userZoomed){
+    fitToView();
+  }
+
+  // Update the member list in the sidebar after rendering the chart.  This
+  // ensures the list always reflects the current set of individuals and
+  // their identifiers.  Each entry is clickable and selects the
+  // corresponding person when clicked.
+  updateMemberList();
+}
+
+/*
+  Populate the Members list in the editor sidebar.  The list displays each
+  person’s Roman enumeration (or name) followed by a sex symbol (♂/♀/◇)
+  and a genetic test marker (‘+’ or ‘−’).  Clicking on an entry selects
+  that person in the chart.  Sorting by Roman label keeps the list
+  consistent with the pedigree’s visual order.
+*/
+function updateMemberList(){
+  const list = document.getElementById('member-list');
+  if(!list) return;
+  // Clear existing entries
+  list.innerHTML = '';
+  // Prepare a sorted array of persons based on their Roman enumeration or name
+  const persons = Array.from(state.persons.values());
+  persons.sort((a,b) => {
+    const al = a.roman || a.name || a.id;
+    const bl = b.roman || b.name || b.id;
+    return al.localeCompare(bl, 'en', {numeric:true});
+  });
+  persons.forEach(p => {
+    const li = document.createElement('li');
+    let label = p.roman || p.name || p.id;
+    // Append sex symbol
+    if(p.sex === 'M') label += ' ♂';
+    else if(p.sex === 'F') label += ' ♀';
+    else label += ' ◇';
+    // Append genetic test marker
+    if(p.gtest === 'positive') label += ' +';
+    else if(p.gtest === 'negative') label += ' −';
+    li.textContent = label;
+    li.dataset.id = p.id;
+    li.style.cursor = 'pointer';
+    li.style.padding = '2px 0';
+    li.onclick = ()=>{
+      state.selected = {type:'person', id:p.id};
+      updateEditor(state.persons.get(p.id));
+      render();
+    };
+    list.appendChild(li);
+  });
+}
+
+// Draw marriage and sibling connection lines after layout.  This function
+// is invoked asynchronously from render() to ensure nodes are positioned
+// before the lines are drawn and animated.
+function drawLines(pos){
+  // Bind marriages to gMarriages groups and append needed line elements.
+  const marriages = Array.from(state.marriages.values());
+  const mSel = gMarriages.selectAll('g.marriage').data(marriages, d => d.id);
+  const mEnter = mSel.enter().append('g').attr('class','marriage');
+  mEnter.append('line').attr('class','marriage-line');
+  mEnter.append('line').attr('class','drop');
+  mEnter.append('line').attr('class','sibline');
+  const mAll = mEnter.merge(mSel);
+  mAll.each(function(m){
+    const g = d3.select(this);
+    const a = pos.get(m.partners[0]), b = pos.get(m.partners[1]);
+    if(!a || !b) return;
+    const y = a.y;
+    // Draw the horizontal marriage line connecting partners.
+    g.select('.marriage-line')
+      .attr('x1', a.x + (layout.nodeW/2) * Math.sign(b.x - a.x))
+      .attr('y1', y)
+      .attr('x2', b.x - (layout.nodeW/2) * Math.sign(b.x - a.x))
+      .attr('y2', y)
+      .on('click', (ev) => { ev.stopPropagation(); selectItem('marriage', m.id); });
+    const mx = (a.x + b.x) / 2;
+    const childCount = m.children.length;
+    // Select existing edge lines associated with this marriage.
+    let lines = g.selectAll('line.edge');
+    if(childCount === 0){
+      // No children: collapse drop and baseline into a point.
+      g.select('.drop')
+        .attr('x1', mx).attr('y1', y)
+        .attr('x2', mx).attr('y2', y);
+      g.select('.sibline')
+        .attr('x1', mx).attr('y1', y)
+        .attr('x2', mx).attr('y2', y);
+      lines.remove();
+    } else if(childCount === 1) {
+      // Single child: collapse the baseline and align the drop over the child.
+      // Without collapsing, a horizontal stub appears below the parents when
+      // only one child is present.  To avoid this, set the sibling baseline
+      // to a zero‑length line at the child's x position and hide it by
+      // setting stroke‑width to zero.  Align the vertical drop directly
+      // above the child so that the connecting lines form a straight path.
+      const cid = m.children[0];
+      const childPos = pos.get(cid);
+      if(!childPos) return;
+      const sibY = y + (layout.nodeH / 2) + 12;
+      // Collapse the sibling baseline to a point at the child's x coordinate.
+      g.select('.sibline')
+        .attr('x1', childPos.x).attr('y1', sibY)
+        .attr('x2', childPos.x).attr('y2', sibY)
+        .attr('stroke-width', 0);
+      // Align the drop over the single child rather than the midpoint.
+      // The drop should begin just below the parent glyph (at y + nodeH/2)
+      // so that it does not pass through the parent's shape.  It then
+      // continues straight down to the sibling baseline.
+      g.select('.drop')
+        .attr('x1', childPos.x)
+        .attr('y1', y + (layout.nodeH / 2))
+        .attr('x2', childPos.x)
+        .attr('y2', sibY);
+      // Bind a single vertical edge from the baseline to the child.
+      lines = lines.data([cid], d => d);
+      lines.join(
+        enter => enter.append('line').attr('class','edge'),
+        update => update,
+        exit => exit.remove()
+      )
+      .attr('x1', childPos.x)
+      .attr('x2', childPos.x)
+      .attr('y1', sibY)
+      .attr('y2', childPos.y - layout.nodeH / 2);
+    } else {
+      // Multiple children: draw baseline and vertical edges with no overshoot.
+      const sibY = y + (layout.nodeH / 2) + 12;
+      const sortedChildren = m.children.slice().sort((id1, id2) => {
+        const x1 = pos.get(id1)?.x || 0;
+        const x2 = pos.get(id2)?.x || 0;
+        return x1 - x2;
+      });
+      const firstX = pos.get(sortedChildren[0]).x;
+      const lastX  = pos.get(sortedChildren[sortedChildren.length - 1]).x;
+      // The baseline spans exactly between the first and last child. No padding is added
+      // so that the line terminates flush with the outermost vertical drops.
+      g.select('.sibline')
+        .attr('x1', firstX).attr('y1', sibY)
+        .attr('x2', lastX).attr('y2', sibY);
+      g.select('.drop')
+        .attr('x1', mx).attr('y1', y)
+        .attr('x2', mx).attr('y2', sibY);
+      lines = lines.data(sortedChildren, d => d);
+      lines.join(
+        enter => enter.append('line').attr('class','edge'),
+        update => update,
+        exit => exit.remove()
+      )
+      .attr('x1', d => pos.get(d).x)
+      .attr('x2', d => pos.get(d).x)
+      .attr('y1', sibY)
+      .attr('y2', d => pos.get(d).y - layout.nodeH / 2);
+    }
+  });
+  mSel.exit().remove();
+  // Animate all connection lines so they draw progressively.
+  gMarriages.selectAll('line')
+    .attr('stroke-dasharray', 1000)
+    .attr('stroke-dashoffset', 1000)
+    .transition().duration(600)
+    .attr('stroke-dashoffset', 0);
+}
+
+// Draw sex glyphs with clipPath id for carrier
+function drawSexShape(g, d){
+  const w = layout.nodeW, h = layout.nodeH;
+  const idClip = `clip-${d.id}`;
+  g.selectAll('*').remove();
+
+  if(d.sex==='F'){
+    g.append('circle').attr('class','shape').attr('r', h/2).attr('cx',0).attr('cy',0);
+    addClip('circle', {r:h/2, cx:0, cy:0});
+  } else if(d.sex==='M'){
+    // Draw male glyph as a square instead of a horizontal rectangle.  Use the
+    // smaller of the configured node dimensions to determine the side length.
+    const size = Math.min(w, h);
+    g.append('rect').attr('class','shape')
+      .attr('x', -size/2).attr('y', -size/2)
+      .attr('width', size).attr('height', size)
+      .attr('rx', 6);
+    addClip('rect', {x:-size/2, y:-size/2, width:size, height:size, rx:6});
+  } else {
+    // diamond
+    g.append('rect').attr('class','shape')
+      .attr('x', -h/2).attr('y', -h/2).attr('width', h).attr('height', h)
+      .attr('transform','rotate(45)').attr('rx',6);
+    const pathD = `M 0 ${-h/2} L ${h/2} 0 L 0 ${h/2} L ${-h/2} 0 Z`;
+    addClip('path', {d:pathD});
+  }
+
+  function addClip(kind, attrs){
+    const defs = d3.select('#svg defs');
+    let cp = defs.select(`#${idClip}`);
+    if(cp.empty()) cp = defs.append('clipPath').attr('id', idClip);
+    cp.selectAll('*').remove();
+    const el = cp.append(kind);
+    Object.entries(attrs).forEach(([k,v])=> el.attr(k,v));
+    g.attr('data-clip', idClip);
+  }
+}
+
+// Carrier fill (half or hatched), clipped to glyph shape
+function drawCarrierFill(g, d){
+  g.selectAll('*').remove();
+  const clipId = d3.select(g.node().parentNode).select('g.glyph').attr('data-clip');
+  if(!clipId) return;
+  if(d.carrier==='none' || !d.carrier) return;
+  const w = layout.nodeW, h = layout.nodeH;
+  g.append('rect')
+    .attr('class','carrier-fill')
+    .attr('clip-path', `url(#${clipId})`)
+    .attr('x', 0).attr('y', -h/2).attr('width', w/2).attr('height', h);
+  g.attr('class', 'carrier ' + (d.carrier==='half' ? 'carrier-half' : 'carrier-hatch'));
+}
+
+function selectItem(type,id){
+  state.selected = {type,id};
+  updateEditor(type==='person'? state.persons.get(id) : null);
+  render();
+}
+
+/* ===========================
+   Editor & Controls
+=========================== */
+function updateEditor(p){
+  const byId = id => document.getElementById(id);
+  if(!p){
+    byId('f-id').value = '';
+    ['f-name','f-dob','f-dod','f-variant','f-ageDx','f-ageDeath','f-notes'].forEach(i=>byId(i).value='');
+    byId('f-sex').value='M';
+    byId('f-carrier').value='none';
+    byId('f-gtest').value='unknown';
+    return;
+  }
+  byId('f-id').value = p.id;
+  byId('f-name').value = p.name||'';
+  byId('f-sex').value = p.sex||'U';
+  byId('f-dob').value = p.dob||'';
+  byId('f-dod').value = p.dod||'';
+  byId('f-variant').value = p.variant||'';
+  byId('f-ageDx').value = p.ageDx||'';
+  byId('f-ageDeath').value = p.ageDeath||'';
+  byId('f-gtest').value = p.gtest||'unknown';
+  byId('f-carrier').value = p.carrier||'none';
+  byId('f-notes').value = p.notes||'';
+}
+
+// Apply editor changes
+document.getElementById('btn-apply').onclick = ()=>{
+  const id = document.getElementById('f-id').value;
+  if(!id || !state.persons.has(id)) return;
+  const p = state.persons.get(id);
+  p.name = document.getElementById('f-name').value.trim();
+  p.sex = document.getElementById('f-sex').value;
+  p.dob = document.getElementById('f-dob').value.trim();
+  p.dod = document.getElementById('f-dod').value.trim();
+  p.variant = document.getElementById('f-variant').value.trim();
+  p.ageDx = parseInt(document.getElementById('f-ageDx').value, 10);
+  p.ageDeath = parseInt(document.getElementById('f-ageDeath').value, 10);
+  p.gtest = document.getElementById('f-gtest').value;
+  p.carrier = document.getElementById('f-carrier').value;
+  p.notes = document.getElementById('f-notes').value.trim();
+  render(); saveToLocalStorage();
+};
+
+/* Toolbar actions via event delegation (works for main buttons and More menu) */
+document.getElementById('toolbar').addEventListener('click', (e)=>{
+  const btn = e.target.closest('button[data-action]');
+  if(!btn) return;
+  const action = btn.dataset.action;
+  switch(action){
+    case 'toggle-editor':
+      document.getElementById('app').classList.toggle('editor-hidden');
+      if(!state._userZoomed) fitToView();
+      break;
+    case 'add-founder': {
+      // Prompt the user for a name and sex when creating a new founder.  Both
+      // fields are mandatory; if the user cancels or enters invalid data
+      // the operation is aborted.  Sex must be either "M" or "F".
+      let name = prompt('Enter a name for the new founder:');
+      if(!name || !name.trim()){
+        alert('Name is required.');
+        return;
+      }
+      let sex = prompt('Enter sex for ' + name.trim() + ' (M/F):');
+      if(!sex) return alert('Sex is required.');
+      sex = sex.trim().toUpperCase();
+      if(sex !== 'M' && sex !== 'F'){
+        alert('Sex must be "M" for male or "F" for female.');
+        return;
+      }
+      const id = addPerson({name:name.trim(), sex});
+      state.selected = {type:'person', id};
+      updateEditor(state.persons.get(id));
+      render(); break;
+    }
+    case 'add-partner': {
+      const sel = state.selected;
+      if(sel.type!=='person') return alert('Select a person first.');
+      const pid = sel.id;
+      // Create a new partner for the selected individual.  If the selected
+      // individual already has at least one marriage, clone them for this
+      // new union so that multiple marriages generate separate trees.
+      const orig = state.persons.get(pid);
+      let partner1Id = pid;
+      if(orig && orig.marriages && orig.marriages.length > 0){
+        const {id: _oldId, marriages: _oldMarriages, ...cloneProps} = orig;
+        partner1Id = addPerson(cloneProps);
+      }
+      // Prompt for partner's name and sex.  Both are required.
+      let pname = prompt('Enter a name for the new partner:');
+      if(!pname || !pname.trim()){
+        alert('Name is required for the new partner.');
+        return;
+      }
+      let psex = prompt('Enter sex for ' + pname.trim() + ' (M/F):');
+      if(!psex) return alert('Sex is required for the new partner.');
+      psex = psex.trim().toUpperCase();
+      if(psex !== 'M' && psex !== 'F'){
+        alert('Sex must be "M" for male or "F" for female.');
+        return;
+      }
+      const newPartner = addPerson({name:pname.trim(), sex:psex});
+      const mid = addMarriage(partner1Id, newPartner);
+      state.selected = {type:'marriage', id:mid};
+      updateEditor(null);
+      render(); saveToLocalStorage();
+      break;
+    }
+    case 'add-child': {
+      const sel = state.selected; let mid = null;
+      if(sel.type==='marriage') mid = sel.id;
+      else if(sel.type==='person'){
+        const p = state.persons.get(sel.id);
+        if(p.marriages && p.marriages[0]) mid = p.marriages[0];
+      }
+      if(!mid) return alert('Select a marriage line or a person who has a partner.');
+      // Prompt for child's name and sex; both are required.
+      let cname = prompt('Enter a name for the new child:');
+      if(!cname || !cname.trim()){
+        alert('Name is required for the new child.');
+        return;
+      }
+      let csex = prompt('Enter sex for ' + cname.trim() + ' (M/F):');
+      if(!csex) return alert('Sex is required for the new child.');
+      csex = csex.trim().toUpperCase();
+      if(csex !== 'M' && csex !== 'F'){
+        alert('Sex must be "M" for male or "F" for female.');
+        return;
+      }
+      const cid = addPerson({name:cname.trim(), sex:csex});
+      linkChild(mid, cid);
+      state.selected = {type:'person', id:cid};
+      updateEditor(state.persons.get(cid));
+      render(); saveToLocalStorage();
+      break;
+    }
+    case 'delete':
+      if(confirm('Delete selected item?')){ deleteSelected(); saveToLocalStorage(); }
+      break;
+    case 'save': saveToLocalStorage(); alert('Saved to browser storage.'); break;
+    case 'load': loadFromLocalStorage(); break;
+    case 'reset': if(confirm('Reset to sample data?')){ resetAll(); } break;
+    case 'export-png': exportPNG(); break;
+    case 'export-pdf': exportPDF(); break;
+  }
+});
+
+// Options
+document.getElementById('inherit-model').onchange = (e)=>{ state.inheritModel = e.target.value; render(); };
+document.getElementById('gender-label-mode').onchange = (e)=>{ state.genderLabelMode = e.target.value; render(); };
+
+// Persist
+function saveToLocalStorage(){
+  const data = {
+    persons: Array.from(state.persons.values()),
+    marriages: Array.from(state.marriages.values()),
+    inheritModel: state.inheritModel
+  };
+  localStorage.setItem('pedigreeData', JSON.stringify(data));
+}
+function loadFromLocalStorage(){
+  const str = localStorage.getItem('pedigreeData');
+  if(!str) return alert('No saved data found.');
+  const data = JSON.parse(str);
+  state.persons = new Map(data.persons.map(p=>[p.id,p]));
+  state.marriages = new Map(data.marriages.map(m=>[m.id,m]));
+  state.inheritModel = data.inheritModel || 'AD';
+  state.selected = {type:null,id:null};
+  document.getElementById('inherit-model').value = state.inheritModel;
+  updateEditor(null);
+  render();
+}
+function resetAll(){
+  state.persons.clear();
+  state.marriages.clear();
+  state.selected = {type:null,id:null};
+  // Populate the pedigree with individuals and relationships derived from the uploaded image.
+  seedFromImage();
+  updateEditor(null);
+  render();
+  saveToLocalStorage();
+}
+
+/* ===========================
+   Export (clean SVG → PNG/PDF)
+=========================== */
+function exportPNG(){
+  const {svgString, width, height} = buildExportSVG();
+  const img = new Image();
+  const svgBlob = new Blob([svgString], {type:'image/svg+xml;charset=utf-8'});
+  const url = URL.createObjectURL(svgBlob);
+  img.onload = function(){
+    const canvas = document.createElement('canvas');
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,width,height);
+    ctx.drawImage(img, 0, 0);
+    canvas.toBlob((blob)=>{
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'pedigree.png';
+      a.click();
+      URL.revokeObjectURL(url);
+    }, 'image/png', 1.0);
+  };
+  img.src = url;
+}
+async function exportPDF(){
+  const {svgString, width, height} = buildExportSVG();
+  const svgBlob = new Blob([svgString], {type:'image/svg+xml;charset=utf-8'});
+  const url = URL.createObjectURL(svgBlob);
+  const img = new Image();
+  img.onload = async function(){
+    const { jsPDF } = window.jspdf;
+    const orientation = width > height ? 'l' : 'p';
+    const pdf = new jsPDF({orientation, unit:'pt', format:[width, height]});
+    pdf.addImage(img, 'PNG', 0, 0, width, height);
+    pdf.save('pedigree.pdf');
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+function buildExportSVG(){
+  const root = d3.select('#root');
+  const clone = root.node().cloneNode(true);
+  clone.setAttribute('transform','');
+
+  const bbox = root.node().getBBox();
+  const pad = 40;
+  const width = Math.ceil(bbox.width + pad*2);
+  const height = Math.ceil(bbox.height + pad*2);
+
+  const defs = d3.select('#svg').select('defs').node().outerHTML;
+  const styles = `
+    <style>
+      .edge, .marriage, .sibline { stroke:#4b5563; fill:none; }
+      .marriage { stroke-width:3; }
+      .person .shape{ fill:#ffffff; stroke:#111827; stroke-width:2; }
+      .affected .shape{ fill:#dc2626; stroke:#dc2626; }
+      .unknown .shape{ fill:#ffffff; stroke:#111827; opacity:0.8; }
+      .carrier-half .carrier-fill{ fill:#94a3b8; }
+      .carrier-hatch .carrier-fill{ fill:url(#hatch); }
+      text{ font-family: ${getComputedStyle(document.documentElement).getPropertyValue('--font')}; fill:#111827; }
+      .name{ font-size:12px; }
+      .sub{ font-size:10.5px; fill:#374151; }
+    </style>`;
+  const svgString = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"
+         viewBox="${bbox.x - pad} ${bbox.y - pad} ${width} ${height}">
+      ${styles}
+      ${defs}
+      ${clone.outerHTML}
+    </svg>`;
+  return {svgString, width, height};
+}
+
+/* ===========================
+   Zoom-to-fit & interactions
+=========================== */
+function fitToView(){
+  const rootNode = gRoot.node();
+  if(!rootNode) return;
+  const bbox = rootNode.getBBox();
+  const svgRect = svg.node().getBoundingClientRect();
+  const margin = 40;
+  const scale = Math.min(
+    (svgRect.width - margin) / bbox.width,
+    (svgRect.height - margin) / bbox.height
+  ) || 1;
+  const translate = [
+    (svgRect.width - bbox.width*scale)/2 - bbox.x*scale,
+    (svgRect.height - bbox.height*scale)/2 - bbox.y*scale
+  ];
+  svg.transition().duration(450)
+    .call(zoom.transform, d3.zoomIdentity.translate(...translate).scale(scale));
+}
+
+// Add child by double-clicking a marriage
+d3.select('#marriages').on('dblclick', (ev)=>{
+  const mGroup = ev.target.closest('g.marriage');
+  if(!mGroup) return;
+  const join = d3.select(mGroup).datum();
+  if(!join || !join.id) return;
+  const cid = addPerson({name:'Child', sex:'U'});
+  linkChild(join.id, cid);
+  state.selected = {type:'person', id:cid};
+  updateEditor(state.persons.get(cid));
+  render(); saveToLocalStorage();
+});
+
+// Initial & resize behavior
+window.addEventListener('resize', ()=>{
+  if(!state._userZoomed) fitToView();
+});
+
+// Boot
+resetAll();
+</script>
+</body>
+</html>
