@@ -1,4 +1,4 @@
-// pedigreeLayout.js  (engine v2 — damped centred relaxation)
+// pedigreeLayout.js  (engine v3 — damped centred relaxation, family-chart spacing)
 // ---------------------------------------------------------------------------
 // Production-style genealogical pedigree layout engine.
 //
@@ -11,8 +11,18 @@
 //   3. Generation layering   – longest-path layers (parent strictly above child)
 //   4. Dummy nodes           – split edges that span more than one generation
 //   5. Ordering              – barycenter sweep to minimise edge crossings
-//                              (couples kept adjacent as a block)
-//   6. Coordinate assignment – barycenter relaxation + overlap resolution
+//                              (couples kept adjacent as a block, male-first)
+//   6. Coordinate assignment – barycenter relaxation + overlap resolution,
+//                              using a variable sibling-gap "separation"
+//                              formula ported from family-chart's d3.tree()
+//                              layout (github.com/donatso/family-chart):
+//                              unrelated neighbours, half-siblings and people
+//                              with several spouses get extra breathing room.
+//                              (family-chart's own CalculateTree is centred on
+//                              one focal person and can't lay out a whole
+//                              multi-family pedigree at once, so we keep this
+//                              engine's DAG pipeline and only borrow its
+//                              spacing technique.)
 //   7. Family connectors      – mating line, sibship bus, child drop-lines
 //
 // Pure & framework-free: it returns geometry only. Rendering is the caller's
@@ -26,6 +36,12 @@ const DEFAULTS = {
     nodeRadius: 28, // half the glyph size (glyph ≈ 52px) – used for edge endpoints
     sweeps: 8, // barycenter ordering sweeps
     xPasses: 60, // coordinate relaxation passes (damped)
+    // family-chart-style separation() multipliers (see calculateTree in
+    // donatso/family-chart) — extra fractions of nodeGap added between
+    // neighbours that are not close blood relatives.
+    unrelatedGapFactor: 0.25, // neighbours that share no parent
+    halfSiblingGapFactor: 0.125, // share one parent but not both
+    spouseGapFactor: 0.5, // extra room per spouse a neighbour has
 };
 
 // ---- minimal union-find (couple / co-parent grouping) ---------------------
@@ -152,11 +168,20 @@ export function computePedigreeLayout(data, options = {}) {
         const seq = {};
         layerNums.forEach((L) => (seq[L] = []));
         const stack = [];
+        // family-chart convention: within a couple, male sits left, female right.
+        const genderRank = (k) => {
+            const pid = node[k].person;
+            if (!pid) return 1;
+            const sx = P(pid).sex;
+            return sx === 'male' ? 0 : sx === 'female' ? 2 : 1;
+        };
         const pushBlock = (key) => {
             if (placed.has(key)) return;
             const blk = node[key].block;
             const L = node[key].layer;
-            const members = layers[L].filter((k) => node[k].block === blk && !placed.has(k));
+            const members = layers[L]
+                .filter((k) => node[k].block === blk && !placed.has(k))
+                .sort((a, b) => genderRank(a) - genderRank(b));
             members.forEach((k) => { placed.add(k);
                 seq[L].push(k); });
             // descend (push children so they are visited near their parents)
@@ -213,9 +238,40 @@ export function computePedigreeLayout(data, options = {}) {
 
     // ---- 6. x coordinates: seed by order, relax to neighbours, de-overlap ---
     const x = {};
-    const gapBetween = (prev, k) =>
-        (node[k].block === node[prev].block && node[k].kind === 'person' && node[prev].kind === 'person') ?
-        opt.coupleGap : opt.nodeGap;
+    // family-chart's calculateTree() spaces siblings with a separation()
+    // multiplier instead of a flat gap: 1 normally, +.25 if the pair shares no
+    // parent, +.125 if they share only one parent (half-siblings), plus extra
+    // room per spouse either neighbour has. Ported here as fractions of nodeGap.
+    const parentKeySet = (key) => new Set(upAdj[key] || []);
+    const sharesParent = (aKey, bKey) => {
+        const pa = parentKeySet(aKey);
+        if (!pa.size) return false;
+        for (const p of parentKeySet(bKey)) if (pa.has(p)) return true;
+        return false;
+    };
+    const sharesBothParents = (aKey, bKey) => {
+        const pa = [...parentKeySet(aKey)].sort();
+        const pb = [...parentKeySet(bKey)].sort();
+        return pa.length > 0 && pa.length === pb.length && pa.every((p, i) => p === pb[i]);
+    };
+    const spouseCountOf = (key) => {
+        const pid = node[key].person;
+        if (!pid) return 0;
+        return (P(pid).spouseIds || []).filter((s) => people[s]).length;
+    };
+    const gapBetween = (prev, k) => {
+        if (node[k].block === node[prev].block && node[k].kind === 'person' && node[prev].kind === 'person') {
+            return opt.coupleGap;
+        }
+        let offset = 1;
+        if (node[k].kind === 'person' && node[prev].kind === 'person') {
+            const related = sharesParent(prev, k);
+            if (!related) offset += opt.unrelatedGapFactor;
+            else if (!sharesBothParents(prev, k)) offset += opt.halfSiblingGapFactor;
+            offset += (spouseCountOf(prev) + spouseCountOf(k)) * opt.spouseGapFactor;
+        }
+        return opt.nodeGap * offset;
+    };
     layerNums.forEach((L) => {
         let cx = 0;
         layers[L].forEach((k, i) => {
