@@ -262,6 +262,38 @@ function MiniGlyph({ person, size = 22 }) {
     </svg>
   );
 }
+/* ---------------- family connectors (lines between relatives) ---------------- */
+const LINE = { mating: "#475569", descent: "#94a3b8" };
+
+function FamilyConnectors({ connectors }) {
+  return (
+    <>
+      {connectors.mating.map((s, i) => (<line key={`mat-${i}`} x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2} stroke={LINE.mating} strokeWidth={2} />))}
+      {connectors.drop.map((s, i) => (<line key={`drp-${i}`} x1={s.x} y1={s.y1} x2={s.x} y2={s.y2} stroke={LINE.descent} strokeWidth={2} />))}
+      {connectors.sibship.map((s, i) => (<line key={`sib-${i}`} x1={s.x1} y1={s.y} x2={s.x2} y2={s.y} stroke={LINE.descent} strokeWidth={2} />))}
+      {connectors.childLink.map((s, i) => (<line key={`cl-${i}`} x1={s.x} y1={s.y1} x2={s.x} y2={s.y2} stroke={LINE.descent} strokeWidth={2} />))}
+      {connectors.longEdge.map((e, i) => (<polyline key={`le-${i}`} points={e.points.map((pt) => pt.join(',')).join(' ')} fill="none" stroke={LINE.descent} strokeWidth={2} />))}
+    </>
+  );
+}
+
+function PersonNode({ person, pos, selected, risk, onSelect, onContextMenu }) {
+  return (
+    <g transform={`translate(${pos.x},${pos.y})`} data-node onClick={onSelect} onContextMenu={onContextMenu} className="cursor-pointer">
+      {selected && <circle r={40} fill="none" stroke="#6366f1" strokeWidth={3} strokeDasharray="4 4" className="opacity-90" />}
+      <PersonGlyph person={person} />
+      <text y={42} textAnchor="middle" className="select-none fill-slate-700 text-xs font-medium">{person.name}</text>
+      {person.deceased && <line x1={-28} y1={-28} x2={28} y2={28} stroke={LINE.mating} strokeWidth={2} />}
+      {risk > 0.5 && (
+        <g transform="translate(34,-34)">
+          <circle r={10} fill="#fee2e2" stroke="#ef4444" />
+          <text textAnchor="middle" dy={4} className="text-[10px]">⚠</text>
+        </g>
+      )}
+    </g>
+  );
+}
+
 function LegendRow({ vertical = false }) {
   const items = [
     { t: 'sq', label: 'مرد' }, { t: 'ci', label: 'زن' }, { t: 'di', label: 'نامشخص' },
@@ -493,30 +525,15 @@ export default function GeneticPedigreeApp() {
                 </defs>
                 <rect x="0" y="0" width="1200" height="700" fill="url(#pgrid)" />
                 <g transform={`translate(${state.offset.x},${state.offset.y}) scale(${state.zoom})`}>
-                  {layout.connectors.mating.map((s, i) => (<line key={`mat-${i}`} x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2} stroke="#475569" strokeWidth={2} />))}
-                  {layout.connectors.drop.map((s, i) => (<line key={`drp-${i}`} x1={s.x} y1={s.y1} x2={s.x} y2={s.y2} stroke="#94a3b8" strokeWidth={2} />))}
-                  {layout.connectors.sibship.map((s, i) => (<line key={`sib-${i}`} x1={s.x1} y1={s.y} x2={s.x2} y2={s.y} stroke="#94a3b8" strokeWidth={2} />))}
-                  {layout.connectors.childLink.map((s, i) => (<line key={`cl-${i}`} x1={s.x} y1={s.y1} x2={s.x} y2={s.y2} stroke="#94a3b8" strokeWidth={2} />))}
-                  {layout.connectors.longEdge.map((e, i) => (<polyline key={`le-${i}`} points={e.points.map((pt) => pt.join(',')).join(' ')} fill="none" stroke="#94a3b8" strokeWidth={2} />))}
+                  <FamilyConnectors connectors={layout.connectors} />
                   {people.map((p) => {
                     const pos = nodes[p.id]; if (!pos) return null;
                     const { risk } = calcCarrierRisk(p, state.data);
-                    const isSel = state.selectedId === p.id;
                     return (
-                      <g key={p.id} transform={`translate(${pos.x},${pos.y})`} data-node
-                        onClick={() => dispatch({ type: 'SELECT', id: p.id })}
-                        onContextMenu={(e) => openMenu(e, p.id)} className="cursor-pointer">
-                        {isSel && <circle r={40} fill="none" stroke="#6366f1" strokeWidth={3} strokeDasharray="4 4" className="opacity-90" />}
-                        <PersonGlyph person={p} />
-                        <text y={42} textAnchor="middle" className="select-none fill-slate-700 text-xs font-medium">{p.name}</text>
-                        {p.deceased && <line x1={-28} y1={-28} x2={28} y2={28} stroke="#475569" strokeWidth={2} />}
-                        {risk > 0.5 && (
-                          <g transform="translate(34,-34)">
-                            <circle r={10} fill="#fee2e2" stroke="#ef4444" />
-                            <text textAnchor="middle" dy={4} className="text-[10px]">⚠</text>
-                          </g>
-                        )}
-                      </g>
+                      <PersonNode key={p.id} person={p} pos={pos} risk={risk}
+                        selected={state.selectedId === p.id}
+                        onSelect={() => dispatch({ type: 'SELECT', id: p.id })}
+                        onContextMenu={(e) => openMenu(e, p.id)} />
                     );
                   })}
                 </g>
