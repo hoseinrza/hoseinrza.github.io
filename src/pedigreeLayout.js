@@ -1,31 +1,50 @@
-// pedigreeLayout.js  (engine v4 — staged pipeline, family-chart-inspired spacing)
+// pedigreeLayout.js  (engine v5 — family-unit model, layered DAG layout)
 // ---------------------------------------------------------------------------
 // Production-style genealogical pedigree layout engine.
 //
 // A pedigree is NOT a tree: every person has up to two biological parents, so
-// the structure is a CONSTRAINED LAYERED DAG. This engine implements the
-// classic Sugiyama-style pipeline specialised for genealogy, as a sequence of
-// small, independently testable stages:
+// the structure is a CONSTRAINED LAYERED DAG. Earlier versions of this engine
+// grouped spouses via ad-hoc union-find over raw person ids. This version is
+// built around a proper FAMILY-UNIT model instead — much closer to how real
+// genealogy data (e.g. GEDCOM) is structured:
 //
-//   1. groupCouples          – union spouses & co-parents into couple blocks
-//   2. layerGroups            – longest-path layering (parent strictly above child)
-//   3. buildLayeredGraph      – per-person nodes + dummy nodes for long edges
-//   4. orderLayers            – DFS seed (male-first couples) + barycenter sweeps
-//                                to minimise edge crossings
-//   5. assignCoordinates      – barycenter relaxation + overlap resolution, using
-//                                a variable sibling-gap "separation" formula
-//                                ported from family-chart's d3.tree() layout
-//                                (github.com/donatso/family-chart): unrelated
-//                                neighbours, half-siblings and people with
-//                                several spouses get extra breathing room.
-//                                (family-chart's own CalculateTree is centred
-//                                on one focal person and can't lay out a whole
-//                                multi-family pedigree at once, so this engine
-//                                keeps its own DAG pipeline and only borrows
-//                                the spacing technique.)
-//   6. buildFamilyConnectors  – mating line, sibship bus, child drop-lines,
-//                                routed through dummy waypoints for long edges
-//   7. normalizeBounds        – shift everything to a top-left margin
+//   a Family = 1-2 parents + their children.
+//
+// Every person belongs to AT MOST one family as a child (their family of
+// origin — you only have one mother and one father), and to zero or more
+// families as a parent (remarriage, multiple partners). That single fact
+// removes most of the special-casing the previous version needed.
+//
+// Pipeline:
+//   1. buildFamilies         – derive Family units from motherId/fatherId and
+//                              spouseIds; index family-of-origin & families-as-parent
+//   2. computeBlocks         – pick each person's "primary" family (the one with
+//                              the most children) to sit adjacent to in the chart
+//   3. computeRowGroups      – union a family's two parents so they always end
+//                              up sharing one generation row
+//   4. assignGenerations     – longest-path layering over row-groups
+//   5. buildLayeredGraph     – per-person nodes + dummy nodes for edges that
+//                              skip a generation (e.g. adoption across generations)
+//   6. orderLayers           – DFS seed (male-first couples) + barycenter sweeps
+//                              to minimise edge crossings
+//   7. assignCoordinates     – damped relaxation + overlap resolution: every
+//                              node is pulled toward the average of its parents
+//                              and children each pass (couples stay adjacent
+//                              via the minimum-gap packing alone — see the
+//                              comment above `damping` for why pulling co-
+//                              parents together directly is unsafe), using a
+//                              variable sibling-gap "separation" formula ported
+//                              from family-chart's d3.tree() layout
+//                              (github.com/donatso/family-chart): unrelated
+//                              neighbours, half-siblings and people with several
+//                              partners get extra breathing room. (family-chart's
+//                              own CalculateTree is centred on one focal person
+//                              and can't lay out a whole multi-family pedigree at
+//                              once, so this engine keeps its own DAG pipeline
+//                              and only borrows the spacing technique.)
+//   8. buildFamilyConnectors – mating line, sibship bus, child drop-lines,
+//                              routed through dummy waypoints for long edges
+//   9. normalizeBounds       – shift everything to a top-left margin
 //
 // Pure & framework-free: it returns geometry only. Rendering is the caller's
 // job, so it can be unit-tested with plain Node.
@@ -37,7 +56,7 @@ const DEFAULTS = {
     layerGap: 150, // vertical gap between generations
     nodeRadius: 28, // half the glyph size (glyph ≈ 52px) – used for edge endpoints
     sweeps: 8, // barycenter ordering sweeps
-    xPasses: 60, // coordinate relaxation passes (damped)
+    xPasses: 60, // coordinate relaxation passes
     margin: 70, // outer margin around the whole chart
     busYFactor: 0.55, // sibship bus line height, as a fraction of layerGap below the parents
     // family-chart-style separation() multipliers (see calculateTree in
@@ -45,7 +64,7 @@ const DEFAULTS = {
     // neighbours that are not close blood relatives.
     unrelatedGapFactor: 0.25, // neighbours that share no parent
     halfSiblingGapFactor: 0.125, // share one parent but not both
-    spouseGapFactor: 0.5, // extra room per spouse a neighbour has
+    spouseGapFactor: 0.5, // extra room per partner-family a neighbour anchors
 };
 
 const EMPTY_LAYOUT = {
@@ -55,7 +74,7 @@ const EMPTY_LAYOUT = {
     bounds: { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 },
 };
 
-// ---- minimal union-find (couple / co-parent grouping) ---------------------
+// ---- minimal union-find, used only to keep a couple on one shared row -----
 function makeDSU() {
     const parent = new Map();
     const find = (x) => {
@@ -77,37 +96,86 @@ function makeDSU() {
     return { find, union };
 }
 
-function parentsOf(people, person) {
-    return [person.motherId, person.fatherId].filter((id) => id && people[id]);
-}
+// ---- stage 1: family units --------------------------------------------------
+// A Family is 1-2 parents + their children. Built once from motherId/fatherId
+// (family of origin) and spouseIds (so a childless couple still gets a mating
+// line); the two sources are unified by keying on the sorted parent-id set, so
+// a couple that both share children AND are marked as spouses map to the same
+// Family rather than being recorded twice.
+function buildFamilies(people, ids) {
+    const families = new Map(); // key -> Family
+    const familyKey = (parentIds) => parentIds.filter(Boolean).sort().join('+');
+    const getOrCreateFamily = (parentIds) => {
+        const validParents = [...new Set(parentIds.filter((pid) => pid && people[pid]))];
+        const key = familyKey(validParents);
+        if (!key) return null;
+        if (!families.has(key)) families.set(key, { id: 'F:' + key, parents: validParents, children: [] });
+        return families.get(key);
+    };
 
-// ---- stage 1: couples & co-parents form one horizontal block --------------
-function groupCouples(people, ids) {
-    const dsu = makeDSU();
-    ids.forEach((id) => dsu.find(id));
     ids.forEach((id) => {
         const p = people[id];
-        (p.spouseIds || []).forEach((s) => {
-            if (people[s]) dsu.union(id, s);
+        const fam = getOrCreateFamily([p.motherId, p.fatherId]);
+        if (fam) fam.children.push(id);
+    });
+    ids.forEach((id) => {
+        (people[id].spouseIds || []).forEach((sid) => getOrCreateFamily([id, sid]));
+    });
+
+    const familyOfOrigin = {}; // personId -> Family | undefined
+    const familiesAsParent = {}; // personId -> Family[]
+    families.forEach((fam) => {
+        fam.children.forEach((cid) => { familyOfOrigin[cid] = fam; });
+        fam.parents.forEach((pid) => { (familiesAsParent[pid] = familiesAsParent[pid] || []).push(fam); });
+    });
+
+    return { families, familyOfOrigin, familiesAsParent };
+}
+
+// ---- stage 2: each person's "primary" family — who they sit adjacent to ---
+// A person can be a parent in several families (remarriage); only one can be
+// their physical neighbour in the chart, so the family with the most children
+// wins (ties broken by family id for determinism). Other partners are still
+// pulled toward them by the coordinate relaxation stage and still get their
+// own full set of connectors — they just aren't guaranteed hard adjacency.
+function computeBlocks(ids, familiesAsParent) {
+    const blockOf = {};
+    ids.forEach((id) => {
+        const fams = familiesAsParent[id] || [];
+        if (fams.length === 0) { blockOf[id] = 'P:' + id; return; }
+        let primary = fams[0];
+        fams.forEach((f) => {
+            if (f.children.length > primary.children.length) primary = f;
+            else if (f.children.length === primary.children.length && f.id < primary.id) primary = f;
         });
-        if (p.motherId && p.fatherId && people[p.motherId] && people[p.fatherId]) {
-            dsu.union(p.motherId, p.fatherId); // co-parents form a couple even w/o spouseIds
-        }
+        blockOf[id] = primary.id;
+    });
+    return blockOf;
+}
+
+// ---- stage 3: a family's two parents always share one generation row -----
+function computeRowGroups(ids, families) {
+    const dsu = makeDSU();
+    ids.forEach((id) => dsu.find(id));
+    families.forEach((fam) => {
+        if (fam.parents.length === 2) dsu.union(fam.parents[0], fam.parents[1]);
     });
     return (id) => dsu.find(id);
 }
 
-// ---- stage 2: longest-path generation layering (cycle-safe) ---------------
-function layerGroups(people, ids, groupOf) {
+// ---- stage 4: longest-path generation layering (cycle-safe) ---------------
+function assignGenerations(ids, families, rowGroupOf) {
     const groupEdges = new Map(); // gp -> Set(gc)
     const addEdge = (gp, gc) => {
         if (gp === gc) return;
         if (!groupEdges.has(gp)) groupEdges.set(gp, new Set());
         groupEdges.get(gp).add(gc);
     };
-    ids.forEach((id) => parentsOf(people, people[id]).forEach((parId) => addEdge(groupOf(parId), groupOf(id))));
+    families.forEach((fam) => {
+        fam.parents.forEach((pid) => fam.children.forEach((cid) => addEdge(rowGroupOf(pid), rowGroupOf(cid))));
+    });
 
-    const groupIds = [...new Set(ids.map(groupOf))];
+    const groupIds = [...new Set(ids.map(rowGroupOf))];
     const layerG = new Map();
     groupIds.forEach((g) => layerG.set(g, 0));
     // iterative relaxation = longest path on a DAG; the iteration cap makes it
@@ -127,12 +195,12 @@ function layerGroups(people, ids, groupOf) {
         if (!changed) break;
     }
     const layerOf = {};
-    ids.forEach((id) => { layerOf[id] = layerG.get(groupOf(id)) || 0; });
+    ids.forEach((id) => { layerOf[id] = layerG.get(rowGroupOf(id)) || 0; });
     return layerOf;
 }
 
-// ---- stage 3: layered graph — one node per person, dummies for long edges -
-function buildLayeredGraph(people, ids, layerOf, groupOf) {
+// ---- stage 5: layered graph — one node per person, dummies for long edges -
+function buildLayeredGraph(people, ids, families, layerOf, blockOf) {
     const layers = {}; // layer -> [nodeKey]
     const node = {}; // nodeKey -> { key, kind, layer, person?, block }
     const pushLayer = (L, key) => { (layers[L] = layers[L] || []).push(key); };
@@ -140,7 +208,7 @@ function buildLayeredGraph(people, ids, layerOf, groupOf) {
     ids.forEach((id) => {
         const L = layerOf[id];
         const key = 'P:' + id;
-        node[key] = { key, kind: 'person', layer: L, person: id, block: 'G:' + groupOf(id) };
+        node[key] = { key, kind: 'person', layer: L, person: id, block: blockOf[id] };
         pushLayer(L, key);
     });
 
@@ -153,24 +221,26 @@ function buildLayeredGraph(people, ids, layerOf, groupOf) {
 
     const dummyChains = {}; // `${parentId}->${childId}` -> [dummyKey] (top->bottom)
     let dseq = 0;
-    ids.forEach((id) => {
-        const Lc = layerOf[id];
-        parentsOf(people, people[id]).forEach((parId) => {
+    families.forEach((fam) => {
+        fam.parents.forEach((parId) => {
             const Lp = layerOf[parId];
-            if (Lc <= Lp) return; // safety guard against any residual cycle
-            if (Lc === Lp + 1) { link('P:' + parId, 'P:' + id); return; }
-            const chain = [];
-            let prev = 'P:' + parId;
-            for (let L = Lp + 1; L <= Lc - 1; L++) {
-                const dk = 'D:' + (dseq++);
-                node[dk] = { key: dk, kind: 'dummy', layer: L, block: dk };
-                pushLayer(L, dk);
-                link(prev, dk);
-                chain.push(dk);
-                prev = dk;
-            }
-            link(prev, 'P:' + id);
-            dummyChains[parId + '->' + id] = chain;
+            fam.children.forEach((id) => {
+                const Lc = layerOf[id];
+                if (Lc <= Lp) return; // safety guard against any residual cycle
+                if (Lc === Lp + 1) { link('P:' + parId, 'P:' + id); return; }
+                const chain = [];
+                let prev = 'P:' + parId;
+                for (let L = Lp + 1; L <= Lc - 1; L++) {
+                    const dk = 'D:' + (dseq++);
+                    node[dk] = { key: dk, kind: 'dummy', layer: L, block: dk };
+                    pushLayer(L, dk);
+                    link(prev, dk);
+                    chain.push(dk);
+                    prev = dk;
+                }
+                link(prev, 'P:' + id);
+                dummyChains[parId + '->' + id] = chain;
+            });
         });
     });
 
@@ -178,11 +248,11 @@ function buildLayeredGraph(people, ids, layerOf, groupOf) {
     return { layers, node, upAdj, downAdj, dummyChains, layerNums };
 }
 
-// ---- stage 4: initial DFS order + barycenter crossing minimisation --------
-function orderLayers(people, ids, { layers, node, upAdj, downAdj, layerNums }, opt) {
+// ---- stage 6: initial DFS order + barycenter crossing minimisation --------
+function orderLayers(people, ids, familyOfOrigin, { layers, node, upAdj, downAdj, layerNums }, opt) {
     const order = {};
 
-    // 4a. seed order via DFS from roots, keeping each couple block adjacent.
+    // 6a. seed order via DFS from roots, keeping each couple block adjacent.
     // family-chart convention: within a couple, male sits left, female right.
     const genderRank = (k) => {
         const pid = node[k].person;
@@ -211,8 +281,8 @@ function orderLayers(people, ids, { layers, node, upAdj, downAdj, layerNums }, o
         }
     };
     const roots = ids
-        .filter((id) => parentsOf(people, people[id]).length === 0)
-        .sort((a, b) => (layerOf(node, a) - layerOf(node, b)) ||
+        .filter((id) => !familyOfOrigin[id])
+        .sort((a, b) => (node['P:' + a].layer - node['P:' + b].layer) ||
             String(people[a].name || '').localeCompare(String(people[b].name || '')))
         .map((id) => 'P:' + id);
     roots.forEach((rk) => {
@@ -231,7 +301,7 @@ function orderLayers(people, ids, { layers, node, upAdj, downAdj, layerNums }, o
         seq[L].forEach((k, i) => (order[k] = i));
     });
 
-    // 4b. barycenter sweeps: reorder each layer toward the average position of
+    // 6b. barycenter sweeps: reorder each layer toward the average position of
     // its neighbours in the layer above/below, alternating direction, while
     // keeping couple blocks glued together.
     const baryOf = (key, useUp) => {
@@ -266,33 +336,27 @@ function orderLayers(people, ids, { layers, node, upAdj, downAdj, layerNums }, o
         const useUp = s % 2 === 0;
         (useUp ? layerNums : [...layerNums].reverse()).forEach((L) => reorderLayer(L, useUp));
     }
-
-    return order;
 }
-function layerOf(node, id) { return node['P:' + id].layer; }
 
-// ---- stage 5: x coordinates — seed by order, relax to neighbours, de-overlap
-function assignCoordinates(people, { node, layers, upAdj, downAdj, layerNums }, opt) {
+// ---- stage 7: x coordinates — damped relaxation + de-overlap --------------
+function assignCoordinates(people, familyOfOrigin, familiesAsParent, { node, layers, upAdj, downAdj, layerNums }, opt) {
     // family-chart's calculateTree() spaces siblings with a separation()
     // multiplier instead of a flat gap: 1 normally, +.25 if the pair shares no
     // parent, +.125 if they share only one parent (half-siblings), plus extra
-    // room per spouse either neighbour has. Ported here as fractions of nodeGap.
-    const parentKeySet = (key) => new Set(upAdj[key] || []);
-    const sharesParent = (aKey, bKey) => {
-        const pa = parentKeySet(aKey);
-        if (!pa.size) return false;
-        for (const p of parentKeySet(bKey)) if (pa.has(p)) return true;
-        return false;
+    // room per partner-family either neighbour anchors. Ported here as
+    // fractions of nodeGap.
+    const sharesParent = (aId, bId) => {
+        const fa = familyOfOrigin[aId],
+            fb = familyOfOrigin[bId];
+        return !!fa && !!fb && fa.parents.some((p) => fb.parents.includes(p));
     };
-    const sharesBothParents = (aKey, bKey) => {
-        const pa = [...parentKeySet(aKey)].sort();
-        const pb = [...parentKeySet(bKey)].sort();
-        return pa.length > 0 && pa.length === pb.length && pa.every((p, i) => p === pb[i]);
+    const sharesBothParents = (aId, bId) => {
+        const fa = familyOfOrigin[aId];
+        return !!fa && fa === familyOfOrigin[bId];
     };
-    const spouseCountOf = (key) => {
+    const spouseFamilyCountOf = (key) => {
         const pid = node[key].person;
-        if (!pid) return 0;
-        return (people[pid].spouseIds || []).filter((s) => people[s]).length;
+        return pid ? (familiesAsParent[pid] || []).length : 0;
     };
     const gapBetween = (prevKey, k) => {
         if (node[k].block === node[prevKey].block && node[k].kind === 'person' && node[prevKey].kind === 'person') {
@@ -300,10 +364,12 @@ function assignCoordinates(people, { node, layers, upAdj, downAdj, layerNums }, 
         }
         let offset = 1;
         if (node[k].kind === 'person' && node[prevKey].kind === 'person') {
-            const related = sharesParent(prevKey, k);
+            const prevId = node[prevKey].person,
+                curId = node[k].person;
+            const related = sharesParent(prevId, curId);
             if (!related) offset += opt.unrelatedGapFactor;
-            else if (!sharesBothParents(prevKey, k)) offset += opt.halfSiblingGapFactor;
-            offset += (spouseCountOf(prevKey) + spouseCountOf(k)) * opt.spouseGapFactor;
+            else if (!sharesBothParents(prevId, curId)) offset += opt.halfSiblingGapFactor;
+            offset += (spouseFamilyCountOf(prevKey) + spouseFamilyCountOf(k)) * opt.spouseGapFactor;
         }
         return opt.nodeGap * offset;
     };
@@ -317,105 +383,105 @@ function assignCoordinates(people, { node, layers, upAdj, downAdj, layerNums }, 
         });
     });
 
-    // same-layer spouse adjacency keeps couples cohesive & centered over their children
-    const spouseAdj = {};
-    Object.keys(node).forEach((key) => {
-        const pid = node[key].person;
-        if (!pid) return;
-        (people[pid].spouseIds || []).forEach((s) => {
-            if (people[s] && node['P:' + s] && node['P:' + s].layer === node[key].layer) {
-                (spouseAdj[key] = spouseAdj[key] || []).push('P:' + s);
-            }
-        });
-    });
-
-    // Centroid-preserving overlap resolver: pack left-to-right to the minimum gaps,
-    // then rigidly shift the whole layer back so its average position is unchanged.
-    // This keeps a row of siblings centred under their parents — a plain one-
-    // directional pack would drift the row to one side.
+    // Overlap resolver: pack left-to-right, pushing a node just far enough right
+    // to satisfy the minimum gap from its left neighbour. A single sweep per
+    // layer is enough to remove every overlap in that layer — each check uses
+    // the neighbour's just-updated position, so a push cascades through the
+    // whole row in one pass.
+    //
+    // This deliberately runs ONCE, after ALL blend passes below, not inside the
+    // per-pass loop. Blend pulls every node toward the average of its relatives
+    // each pass; for any node NOT involved in the pull (or an entire connected
+    // group of them), that average is translation-invariant — shifting the whole
+    // group by a constant leaves every average, and so every blend step, exactly
+    // unchanged. Packing is the only step that isn't translation-invariant: it
+    // clamps against an absolute minimum gap. If a gap keeps getting violated
+    // pass after pass — blend keeps pulling a node one way, the minimum gap
+    // requires the other — packing only ever pushes right, never left, so
+    // running it every pass keeps adding the same small correction with nothing
+    // to cancel it, and an entire connected side of the chart drifts sideways
+    // without bound over enough passes. Confining packing to a single pass at
+    // the end still guarantees a collision-free result, just without an
+    // opportunity to accumulate.
     const resolve = (L) => {
         const keys = layers[L];
-        if (keys.length < 2) return;
-        const before = keys.reduce((s, k) => s + x[k], 0) / keys.length;
         for (let i = 1; i < keys.length; i++) {
             const need = x[keys[i - 1]] + gapBetween(keys[i - 1], keys[i]);
             if (x[keys[i]] < need) x[keys[i]] = need;
         }
-        const after = keys.reduce((s, k) => s + x[k], 0) / keys.length;
-        const shift = before - after;
-        if (shift) for (const k of keys) x[k] += shift;
     };
 
-    // Pull every node toward the average of its parents, children and spouse(s),
-    // damped, with centroid-preserving overlap resolution each pass. Converges to
-    // a stable, centred, untangled layout.
+    // Damped relaxation: pull every node toward the plain average of its own
+    // parents and children, each pass. This is the one part of the whole
+    // pipeline that has to stay a PURE average of each node's OWN current
+    // neighbours — nothing else — because that's what keeps it bounded: a
+    // node's new position is always a weighted blend of its old position and
+    // its neighbours' current positions, so it can never end up outside the
+    // range its neighbours already occupy. Two tempting variations both break
+    // that guarantee and were tried and reverted: pulling same-layer co-parents
+    // together directly (on top of their own parent/child pulls) lets a hub
+    // with two marriages average partly against copies of its own position;
+    // moving a couple as one rigid unit toward their COMBINED neighbour average
+    // shifts each member by a fixed offset from that average, which can land
+    // outside the neighbours' range by design. Both look reasonable per pass,
+    // but compound over many passes into unbounded drift for exactly the kind
+    // of family (remarriage, or an unrelated person sharing a generation) this
+    // engine has to support. Couples still end up adjacent — resolve() below
+    // enforces coupleGap as a hard minimum regardless of what blend does.
     const allKeys = Object.keys(node);
+    const damping = 0.6;
     for (let pass = 0; pass < opt.xPasses; pass++) {
         const target = {};
         for (const k of allKeys) {
             const ups = upAdj[k] || [],
-                downs = downAdj[k] || [],
-                sps = spouseAdj[k] || [];
+                downs = downAdj[k] || [];
             let sum = 0,
                 cnt = 0;
             for (const a of ups) { sum += x[a]; cnt++; }
             for (const a of downs) { sum += x[a]; cnt++; }
-            for (const a of sps) { sum += x[a]; cnt++; }
             target[k] = cnt ? sum / cnt : x[k];
         }
-        for (const k of allKeys) x[k] = x[k] * 0.4 + target[k] * 0.6;
-        layerNums.forEach(resolve);
+        for (const k of allKeys) x[k] = x[k] * (1 - damping) + target[k] * damping;
     }
-    layerNums.forEach(resolve); // final: centred & collision-free
+    layerNums.forEach(resolve); // single collision-free pass, see comment above
 
     return x;
 }
 
-// ---- stage 6: family connectors — mating line, sibship bus, child drops ---
-// Every connector is derived purely from motherId/fatherId, independent of how
-// x was computed, so it stays correct even if the coordinate stage changes.
-function buildFamilyConnectors(people, ids, layerOf, nodeXY, dummyContext, opt) {
-    const { x, node, dummyChains } = dummyContext;
+// ---- stage 8: family connectors — mating line, sibship bus, child drops ---
+// Every connector is derived directly from the Family units, independent of
+// how x was computed, so it stays correct even if the coordinate stage changes.
+function buildFamilyConnectors(families, layerOf, nodeXY, dummyChains, node, x, opt) {
     const yOf = (L) => L * opt.layerGap;
     const r = opt.nodeRadius;
     const connectors = { mating: [], drop: [], sibship: [], childLink: [], longEdge: [] };
 
-    const families = new Map(); // "motherId+fatherId" -> { m, f, children:[] }
-    ids.forEach((id) => {
-        const c = people[id];
-        const m = c.motherId && people[c.motherId] ? c.motherId : null;
-        const f = c.fatherId && people[c.fatherId] ? c.fatherId : null;
-        if (!m && !f) return;
-        const fkey = [m, f].filter(Boolean).sort().join('+');
-        if (!families.has(fkey)) families.set(fkey, { m, f, children: [] });
-        families.get(fkey).children.push(id);
-    });
-
-    families.forEach(({ m, f, children }) => {
-        const partners = [m, f].filter(Boolean);
-        const parentLayer = Math.max(...partners.map((p) => layerOf[p]));
+    families.forEach(({ parents, children }) => {
+        if (parents.length === 0) return;
+        const parentLayer = Math.max(...parents.map((p) => layerOf[p]));
         const parentY = yOf(parentLayer);
-        const junctionX = addMatingLine({ m, f, parentY });
+        const junctionX = addMatingLine(parents, parentY);
 
         const near = children.filter((c) => layerOf[c] === parentLayer + 1);
         const far = children.filter((c) => layerOf[c] > parentLayer + 1);
-        const dropStartY = parentY + (m && f ? 0 : r);
+        const dropStartY = parentY + (parents.length === 2 ? 0 : r);
         if (near.length) addNearChildren({ junctionX, parentY, dropStartY, near });
-        far.forEach((c) => addFarChild({ junctionX, dropStartY, m, f, c }));
+        far.forEach((c) => addFarChild({ junctionX, dropStartY, parents, c }));
     });
 
     return connectors;
 
-    function addMatingLine({ m, f, parentY }) {
-        if (m && f) {
-            const xm = nodeXY[m].x,
-                xf = nodeXY[f].x;
-            const lo = Math.min(xm, xf),
-                hi = Math.max(xm, xf);
+    function addMatingLine(parents, parentY) {
+        if (parents.length === 2) {
+            const [a, b] = parents;
+            const xa = nodeXY[a].x,
+                xb = nodeXY[b].x;
+            const lo = Math.min(xa, xb),
+                hi = Math.max(xa, xb);
             connectors.mating.push({ x1: lo + r, y1: parentY, x2: hi - r, y2: parentY });
-            return (xm + xf) / 2;
+            return (xa + xb) / 2;
         }
-        return nodeXY[m || f].x;
+        return nodeXY[parents[0]].x;
     }
 
     function addNearChildren({ junctionX, parentY, dropStartY, near }) {
@@ -428,8 +494,8 @@ function buildFamilyConnectors(people, ids, layerOf, nodeXY, dummyContext, opt) 
         near.forEach((c) => connectors.childLink.push({ x: nodeXY[c].x, y1: busY, y2: nodeXY[c].y - r }));
     }
 
-    function addFarChild({ junctionX, dropStartY, m, f, c }) {
-        const via = (m && dummyChains[m + '->' + c]) ? m : (f && dummyChains[f + '->' + c] ? f : null);
+    function addFarChild({ junctionX, dropStartY, parents, c }) {
+        const via = parents.find((p) => dummyChains[p + '->' + c]) || null;
         const points = [[junctionX, dropStartY]];
         if (via) (dummyChains[via + '->' + c] || []).forEach((dk) => points.push([x[dk], yOf(node[dk].layer)]));
         points.push([nodeXY[c].x, nodeXY[c].y - r]);
@@ -437,7 +503,7 @@ function buildFamilyConnectors(people, ids, layerOf, nodeXY, dummyContext, opt) 
     }
 }
 
-// ---- stage 7: shift everything to a top-left margin ------------------------
+// ---- stage 9: shift everything to a top-left margin ------------------------
 function normalizeBounds(ids, nodes, connectors, opt) {
     const allX = ids.map((id) => nodes[id].x);
     const allY = ids.map((id) => nodes[id].y);
@@ -467,16 +533,18 @@ export function computePedigreeLayout(data, options = {}) {
     const ids = Object.keys(people);
     if (ids.length === 0) return EMPTY_LAYOUT;
 
-    const groupOf = groupCouples(people, ids);
-    const layerOfId = layerGroups(people, ids, groupOf);
-    const graph = buildLayeredGraph(people, ids, layerOfId, groupOf);
-    orderLayers(people, ids, graph, opt);
-    const x = assignCoordinates(people, graph, opt);
+    const { families, familyOfOrigin, familiesAsParent } = buildFamilies(people, ids);
+    const blockOf = computeBlocks(ids, familiesAsParent);
+    const rowGroupOf = computeRowGroups(ids, families);
+    const layerOfId = assignGenerations(ids, families, rowGroupOf);
+    const graph = buildLayeredGraph(people, ids, families, layerOfId, blockOf);
+    orderLayers(people, ids, familyOfOrigin, graph, opt);
+    const x = assignCoordinates(people, familyOfOrigin, familiesAsParent, graph, opt);
 
     const nodes = {};
     ids.forEach((id) => { nodes[id] = { x: x['P:' + id], y: layerOfId[id] * opt.layerGap }; });
 
-    const connectors = buildFamilyConnectors(people, ids, layerOfId, nodes, { x, node: graph.node, dummyChains: graph.dummyChains }, opt);
+    const connectors = buildFamilyConnectors(families, layerOfId, nodes, graph.dummyChains, graph.node, x, opt);
     const bounds = normalizeBounds(ids, nodes, connectors, opt);
 
     const generations = {};
